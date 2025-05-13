@@ -32,6 +32,7 @@ from scipy.optimize import least_squares
 import functools
 from dataclasses import dataclass
 import argparse
+import csv
 import re
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -1752,8 +1753,6 @@ def check_and_fix_features(feature_file_path: Path, expected_descriptor_dim: int
 
     return check_successful
 
-
-# --- Undistortion Function ---
 def undistort_images_fisheye(
     image_list_path,
     original_image_dir,
@@ -1920,7 +1919,6 @@ def save_processed_data(
 
     return save_ok
 
-
 def load_processed_data(
     output_dir: Path,
     lidar_data_filename: str = "processed_lidar_data.npz",
@@ -2047,9 +2045,6 @@ def load_processed_data(
 
     return processed_lidar_data, rendered_views_info
 
-# ==============================================================================
-# Function to Load and Prepare Pose Data
-# ==============================================================================
 def load_and_prepare_poses(csv_path, target_camera):
     """Loads poses from CSV, filters by camera, sorts by time, and converts to matrices."""
     logging.info(f"Loading poses for camera '{target_camera}' from {csv_path}")
@@ -2065,7 +2060,7 @@ def load_and_prepare_poses(csv_path, target_camera):
 
         if df_cam.empty:
             logging.warning(f"No poses found for camera '{target_camera}' in the CSV.")
-            return None
+            return None, None # Modified to return two Nones as per load_and_prepare_ego_poses
 
         # Convert timestamp and pose columns to numeric first
         df_cam['timestamp'] = pd.to_numeric(df_cam['timestamp'], errors='coerce')
@@ -2076,14 +2071,14 @@ def load_and_prepare_poses(csv_path, target_camera):
         df_cam.dropna(subset=['timestamp'] + pose_cols, inplace=True)
         if df_cam.empty:
              logging.error(f"No valid numeric pose data found for camera '{target_camera}' after cleaning.")
-             return None
+             return None, None # Modified
 
-        # Now convert timestamp to integer (assuming microseconds)
         try:
+            # Timestamps are microseconds
             df_cam['timestamp'] = df_cam['timestamp'].astype(np.int64)
         except ValueError as e:
-            logging.error(f"Could not convert cleaned timestamps to int64 for camera '{target_camera}': {e}. Check data format (should be microseconds).")
-            return None
+            logging.error(f"Could not convert cleaned timestamps to int64 for camera '{target_camera}': {e}. Check data format.")
+            return None, None # Modified
 
         df_cam.sort_values(by='timestamp', inplace=True)
         df_cam.reset_index(drop=True, inplace=True)
@@ -2095,7 +2090,7 @@ def load_and_prepare_poses(csv_path, target_camera):
                 pose_flat = row[pose_cols].values.astype(np.float64)
                 pose_matrix = pose_flat.reshape(4, 4)
                 poses.append(pose_matrix)
-                timestamps.append(row['timestamp']) # Timestamp is already int64 (microseconds)
+                timestamps.append(row['timestamp']) # row['timestamp'] is already int64 (microseconds)
             except ValueError:
                 logging.warning(f"Could not reshape pose at timestamp {row['timestamp']}. Skipping row {index}.")
                 continue
@@ -2105,17 +2100,17 @@ def load_and_prepare_poses(csv_path, target_camera):
 
         if not timestamps:
             logging.error(f"No valid poses could be constructed for camera '{target_camera}'.")
-            return None
+            return None, None # Modified
 
-        logging.info(f"Prepared {len(timestamps)} valid, sorted poses (timestamps in microseconds) for '{target_camera}'.")
-        return np.array(timestamps), poses
+        logging.info(f"Prepared {len(timestamps)} valid, sorted poses for '{target_camera}'.")
+        return np.array(timestamps, dtype=np.int64), poses # Timestamps are microseconds
 
     except FileNotFoundError:
         logging.error(f"Pose CSV file not found at: {csv_path}")
-        return None
+        return None, None # Modified
     except Exception as e:
         logging.error(f"Error reading or processing pose CSV: {e}", exc_info=True)
-        return None
+        return None, None # Modified
 
 def load_and_prepare_ego_poses(csv_path):
     """
@@ -2128,7 +2123,7 @@ def load_and_prepare_ego_poses(csv_path):
 
     Returns:
         tuple[np.ndarray | None, list | None]: A tuple containing:
-            - sorted_timestamps_us (np.ndarray): NumPy array of sorted timestamps (microseconds).
+            - sorted_timestamps_us (np.ndarray): NumPy array of sorted microsecond timestamps.
             - sorted_poses (list): List of corresponding 4x4 NumPy pose matrices (T_map_ego).
             Returns (None, None) on failure.
     """
@@ -2154,9 +2149,10 @@ def load_and_prepare_ego_poses(csv_path):
              return None, None
 
         try:
-            df['timestamp'] = df['timestamp'].astype(np.int64) # Timestamps are microseconds
+            # Timestamps are microseconds
+            df['timestamp'] = df['timestamp'].astype(np.int64)
         except ValueError as e:
-            logging.error(f"Could not convert cleaned timestamps to int64 in ego poses: {e}. Check data format (should be microseconds).")
+            logging.error(f"Could not convert cleaned timestamps to int64 in ego poses: {e}. Check data format.")
             return None, None
 
         df.sort_values(by='timestamp', inplace=True)
@@ -2168,7 +2164,6 @@ def load_and_prepare_ego_poses(csv_path):
             try:
                 pose_flat = row[pose_cols].values.astype(np.float64)
                 pose_matrix = pose_flat.reshape(4, 4)
-
                 R_mat = pose_matrix[:3, :3]
                 if not np.isclose(np.linalg.det(R_mat), 1.0, atol=1e-4):
                      logging.warning(f"Invalid rotation matrix determinant ({np.linalg.det(R_mat):.4f}) found at timestamp {row['timestamp']}. Skipping row {index}.")
@@ -2176,9 +2171,8 @@ def load_and_prepare_ego_poses(csv_path):
                 if not np.allclose(R_mat.T @ R_mat, np.eye(3), atol=1e-4):
                      logging.warning(f"Rotation matrix not orthogonal for timestamp {row['timestamp']}. Skipping row {index}.")
                      continue
-
                 poses.append(pose_matrix)
-                timestamps_us.append(row['timestamp']) # Timestamp is int64 (microseconds)
+                timestamps_us.append(row['timestamp']) # row['timestamp'] is already int64 (microseconds)
             except ValueError:
                 logging.warning(f"Could not reshape pose at timestamp {row['timestamp']}. Skipping row {index}.")
                 continue
@@ -2190,16 +2184,16 @@ def load_and_prepare_ego_poses(csv_path):
             logging.error(f"No valid ego poses could be constructed from '{csv_path}'.")
             return None, None
 
-        sorted_timestamps_us_np = np.array(timestamps_us)
+        sorted_timestamps_us_np = np.array(timestamps_us, dtype=np.int64)
 
         if len(sorted_timestamps_us_np) > 1 and not np.all(np.diff(sorted_timestamps_us_np) > 0):
-            logging.warning(f"Timestamps in {csv_path} are not strictly increasing after processing. Check source data or sorting. Re-sorting.")
+            logging.warning(f"Timestamps in {csv_path} are not strictly increasing after processing. Re-sorting.")
             sort_indices = np.argsort(sorted_timestamps_us_np)
             sorted_timestamps_us_np = sorted_timestamps_us_np[sort_indices]
             poses = [poses[i] for i in sort_indices]
 
-        logging.info(f"Prepared {len(poses)} valid, sorted ego poses (timestamps in microseconds).")
-        return sorted_timestamps_us_np, poses
+        logging.info(f"Prepared {len(poses)} valid, sorted ego poses.")
+        return sorted_timestamps_us_np, poses # Timestamps are microseconds
 
     except FileNotFoundError:
         logging.error(f"Ego pose CSV file not found at: {csv_path}")
@@ -2208,33 +2202,32 @@ def load_and_prepare_ego_poses(csv_path):
         logging.error(f"Error reading or processing ego pose CSV '{csv_path}': {e}", exc_info=True)
         return None, None
 
-# ==============================================================================
-# Function to Find or Interpolate Pose
-# ==============================================================================
 def get_pose_for_timestamp(query_ts_us, timestamps_us, poses, tolerance_us=1000):
     """
-    Finds exact pose or interpolates. Timestamps and tolerance are in microseconds.
-    Default tolerance is 1000 us = 1 ms.
+    Finds exact pose or interpolates between two poses using SLERP and LERP.
+    Timestamps are expected in microseconds. Tolerance is in microseconds.
     """
-    if timestamps_us is None or not poses:
-        logging.warning(f"No pose data available to query for timestamp {query_ts_us} (us).")
+    if timestamps_us is None or not poses or len(timestamps_us) == 0: # Added len check
+        logging.warning(f"No pose data available to query for timestamp {query_ts_us}.")
         return None
 
     n_poses = len(timestamps_us)
+
     idx = bisect_left(timestamps_us, query_ts_us)
 
     if idx < n_poses and abs(timestamps_us[idx] - query_ts_us) <= tolerance_us:
-        logging.debug(f"Exact match found for timestamp {query_ts_us} (us) at index {idx}.")
+        logging.debug(f"Exact match found for timestamp {query_ts_us} at index {idx}.")
         return poses[idx]
     if idx > 0 and abs(timestamps_us[idx - 1] - query_ts_us) <= tolerance_us:
-         logging.debug(f"Exact match found for timestamp {query_ts_us} (us) at index {idx-1}.")
+         logging.debug(f"Exact match found for timestamp {query_ts_us} at index {idx-1}.")
          return poses[idx-1]
 
     if idx == 0:
-        logging.warning(f"Query timestamp {query_ts_us} (us) is before the first pose timestamp {timestamps_us[0]} (us). Cannot interpolate.")
+        logging.warning(f"Query timestamp {query_ts_us} is before the first pose timestamp {timestamps_us[0]}. Cannot interpolate.")
         return None
+
     if idx == n_poses:
-        logging.warning(f"Query timestamp {query_ts_us} (us) is after the last pose timestamp {timestamps_us[-1]} (us). Cannot interpolate.")
+        logging.warning(f"Query timestamp {query_ts_us} is after the last pose timestamp {timestamps_us[-1]}. Cannot interpolate.")
         return None
 
     t0_us = timestamps_us[idx - 1]
@@ -2247,7 +2240,7 @@ def get_pose_for_timestamp(query_ts_us, timestamps_us, poses, tolerance_us=1000)
         return None
 
     alpha = (query_ts_us - t0_us) / (t1_us - t0_us)
-    logging.debug(f"Interpolating for {query_ts_us} (us) between {t0_us} (us) and {t1_us} (us) with alpha={alpha:.4f}")
+    logging.debug(f"Interpolating for {query_ts_us} between {t0_us} and {t1_us} with alpha={alpha:.4f}")
 
     try:
         R0 = R.from_matrix(pose0[:3, :3])
@@ -2255,36 +2248,40 @@ def get_pose_for_timestamp(query_ts_us, timestamps_us, poses, tolerance_us=1000)
         T0 = pose0[:3, 3]
         T1 = pose1[:3, 3]
     except ValueError as e:
-         logging.error(f"Failed to create Rotation object from matrices at {t0_us} or {t1_us} (us). Invalid rotation? Error: {e}")
+         logging.error(f"Failed to create Rotation object from matrices at {t0_us} or {t1_us}. Invalid rotation? Error: {e}")
          return None
+
     try:
+        # Slerp uses the actual timestamp values for interpolation points
         slerp_interpolator = Slerp([t0_us, t1_us], R.concatenate([R0, R1]))
         R_interp = slerp_interpolator([query_ts_us])[0]
     except Exception as e:
-        logging.error(f"SLERP failed between timestamps {t0_us} (us) and {t1_us} (us): {e}")
+        logging.error(f"SLERP failed between timestamps {t0_us} and {t1_us}: {e}")
         return None
 
     T_interp = T0 + alpha * (T1 - T0)
+
     pose_interp = np.eye(4)
     pose_interp[:3, :3] = R_interp.as_matrix()
     pose_interp[:3, 3] = T_interp
     return pose_interp
 
-def get_init_poses(init_pose_path, camera_name, query_img_list):
+def get_init_poses(init_pose_path, camera_name, query_img_list_path_str):
     pose_data = load_and_prepare_poses(init_pose_path, camera_name)
-    if pose_data is None:
-        logging.error("Failed to load pose data. Exiting.")
-        exit()
+    if pose_data is None or pose_data[0] is None: # Check if load_and_prepare_poses returned (None,None)
+        logging.error(f"Failed to load pose data for {camera_name}. Exiting.")
+        exit(1) # Ensure exit if critical data is missing
     sorted_timestamps_us, sorted_poses = pose_data # Timestamps are in microseconds
 
     query_poses = []
     not_found_count = 0
+
     try:
-        with open(query_img_list, 'r') as f:
+        with open(query_img_list_path_str, 'r') as f: # Use renamed arg
             query_image_names = [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
-        logging.error(f"Query image list file not found: {query_img_list}")
-        exit()
+        logging.error(f"Query image list file not found: {query_img_list_path_str}")
+        exit(1) # Ensure exit
 
     logging.info(f"\n--- Looking up poses for {len(query_image_names)} query images ---")
     start_lookup_time = time.time()
@@ -2294,12 +2291,13 @@ def get_init_poses(init_pose_path, camera_name, query_img_list):
             base_name = os.path.splitext(image_name)[0]
             query_ts_us = int(base_name) # Timestamp from filename is microseconds
 
-            # get_pose_for_timestamp uses its default tolerance_us=1000 (1ms) here
             interpolated_pose = get_pose_for_timestamp(
-                query_ts_us,
-                sorted_timestamps_us,
+                query_ts_us, # Pass microsecond timestamp
+                sorted_timestamps_us, # Pass sorted microsecond timestamps
                 sorted_poses
+                # Default tolerance_us=1000 (1ms) from get_pose_for_timestamp
             )
+
             if interpolated_pose is not None:
                 query_poses.append(interpolated_pose)
                 logging.debug(f"Found/Interpolated pose for {image_name} (ts_us: {query_ts_us})")
@@ -2307,148 +2305,243 @@ def get_init_poses(init_pose_path, camera_name, query_img_list):
                 logging.warning(f"Could not determine pose for {image_name} (ts_us: {query_ts_us}).")
                 not_found_count += 1
         except ValueError:
-            logging.warning(f"Could not parse timestamp (microseconds) from query image name: {image_name}. Skipping.")
+            logging.warning(f"Could not parse timestamp from query image name: {image_name}. Skipping.")
             not_found_count += 1
         except Exception as e:
             logging.error(f"Error processing query image {image_name}: {e}", exc_info=True)
             not_found_count += 1
+
     lookup_duration = time.time() - start_lookup_time
     logging.info(f"--- Pose lookup finished in {lookup_duration:.2f} seconds ---")
     logging.info(f"Successfully found/interpolated poses for {len(query_poses)} images.")
     if not_found_count > 0:
         logging.warning(f"Could not determine poses for {not_found_count} images.")
+    
+    if not query_poses and query_image_names: # If list was not empty but no poses found
+        logging.error(f"No initial poses could be determined for any query image in {camera_name}. This is critical.")
+        # Depending on pipeline, might need to exit here if RENDER_POSES is essential
+        # exit(1) 
+    
     return query_poses
 
-# --- Add SE(3)/se(3) Utilities (Step 2) ---
 def skew_symmetric(v):
-    return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.array([
+        [0, -v[2], v[1]],
+        [v[2], 0, -v[0]],
+        [-v[1], v[0], 0]
+    ])
 
 def se3_to_SE3(xi):
-    omega = xi[:3]; v = xi[3:]
+    omega = xi[:3]
+    v = xi[3:]
     theta = np.linalg.norm(omega)
-    if np.isclose(theta, 0.0): R_mat = np.eye(3); t = v
+    if np.isclose(theta, 0.0):
+        R_mat = np.eye(3)
+        t = v
     else:
-        axis = omega / theta; omega_skew_axis = skew_symmetric(axis)
+        # axis = omega / theta # Not directly used in from_rotvec
+        omega_skew = skew_symmetric(omega) # Skew of omega (axis * theta)
+        # R_mat = R.from_rotvec(omega).as_matrix() # Correct way
+        # Using Rodrigues' formula for R (from_rotvec essentially does this)
+        # R = I + sin(theta)/theta * omega_skew + (1-cos(theta))/theta^2 * omega_skew @ omega_skew
+        # Simpler: use scipy
         R_mat = R.from_rotvec(omega).as_matrix()
-        V = np.eye(3) + ((1 - np.cos(theta)) / (theta**2)) * omega_skew_axis * theta + \
-            ((theta - np.sin(theta)) / (theta**3)) * (omega_skew_axis @ omega_skew_axis) * (theta**2)
+
+        # For V matrix (mapping se(3) translation to SE(3) translation)
+        # V = I + (1-cos(theta))/theta^2 * omega_skew + (theta-sin(theta))/theta^3 * omega_skew @ omega_skew
+        # omega_skew is skew of (axis * theta)
+        V = np.eye(3) + \
+            ((1 - np.cos(theta)) / (theta**2)) * omega_skew + \
+            ((theta - np.sin(theta)) / (theta**3)) * (omega_skew @ omega_skew)
         t = V @ v
-    T = np.eye(4); T[:3, :3] = R_mat; T[:3, 3] = t
+    T = np.eye(4)
+    T[:3, :3] = R_mat
+    T[:3, 3] = t
     return T
 
 def SE3_to_se3(T_SE3):
-    R_mat = T_SE3[:3, :3]; t_vec = T_SE3[:3, 3]
-    r_obj = R.from_matrix(R_mat); omega = r_obj.as_rotvec()
+    R_mat = T_SE3[:3, :3]
+    t_vec = T_SE3[:3, 3]
+    r_obj = R.from_matrix(R_mat)
+    omega = r_obj.as_rotvec() 
     theta = np.linalg.norm(omega)
-    if np.isclose(theta, 0.0): V_inv = np.eye(3)
+
+    if np.isclose(theta, 0.0):
+        V_inv = np.eye(3)
     else:
-        axis = omega / theta; omega_skew_axis = skew_symmetric(axis)
+        omega_skew = skew_symmetric(omega) # Skew of omega (axis*theta)
+        # V_inv = I - 1/2 * omega_skew + (1/theta^2 - cot(theta/2)/(2*theta)) * omega_skew^2
+        # cot(x) = 1/tan(x)
+        # term_coeff = (1.0 / theta**2) - (1.0 / (2.0 * theta * np.tan(theta / 2.0)))
+        # This formula for V_inv using unnormalized omega_skew is common.
+        # Let's use the one based on normalized axis from a reference (e.g. Barfoot R_so3.cpp logmap)
+        # V_inv = I - 0.5 * omega_skew + (1 - theta*cot(theta/2)/2) / theta^2 * (omega_skew @ omega_skew)
+        # where cot(theta/2) = cos(theta/2)/sin(theta/2)
+        
+        # Simplified from common robotics texts:
+        # V_inv = I - (1/2) * omega_skew + ( (1/theta**2) - ( (1+cos(theta)) / (2*theta*sin(theta)) ) ) * omega_skew**2
+        # Handle sin(theta) close to zero if theta is near pi for the above formula.
+        # The provided code's version seems based on normalized axis, let's stick to its structure but ensure omega is used correctly.
+        # The original code used `omega_skew_axis` which implies `axis` was `omega/theta`.
+        # omega_skew = skew_symmetric(omega)
+        
+        # Using the formula from the original code, which seems to be:
+        # V_inv = I - (1/2) * skew(omega) + (1/theta^2 - cot(theta/2)/(2*theta)) * skew(omega)^2
+        # Let's use the axis-angle based one which is often more stable or clearer.
+        # omega = axis * theta
+        # omega_skew_axis = skew_symmetric(omega / theta)
+        # V_inv = np.eye(3) - (theta / 2.0) * omega_skew_axis + \
+        #        (1.0 - (theta / 2.0) * (np.cos(theta / 2.0) / np.sin(theta / 2.0))) * (omega_skew_axis @ omega_skew_axis)
+
+        # The original code's V_inv was:
         half_theta = theta / 2.0
-        if np.isclose(np.sin(half_theta), 0.0):
-            logging.warning(f"SE3_to_se3: sin(half_theta) is close to zero ({np.sin(half_theta)}) with theta={theta}.")
-            V_inv = np.eye(3) - 0.5 * skew_symmetric(omega)
+        if np.isclose(np.sin(half_theta), 0.0): # Should be caught by theta approx 0
+             V_inv = np.eye(3) - 0.5 * skew_symmetric(omega)
         else:
             term_cot_coeff = (theta / 2.0) * (np.cos(half_theta) / np.sin(half_theta))
+            # omega_skew_axis was skew_symmetric(axis), where axis = omega/theta.
+            # So (omega_skew_axis @ omega_skew_axis) is (skew(omega/theta) @ skew(omega/theta))
+            # We can write skew(omega) = theta * skew(omega/theta)
+            # So skew(omega/theta) = (1/theta) * skew(omega)
+            # (skew(omega/theta))^2 = (1/theta^2) * skew(omega)^2
+            # The formula becomes: I - (1/2)skew(omega) + (1 - term_cot_coeff)/theta^2 * skew(omega)^2
+            # This looks like the (1/theta^2 - cot(theta/2)/(2*theta)) type term.
+
+            # Let's use a standard V_inv formula:
+            # V_inv = I - 0.5*skew(omega) + (1/theta^2 - (1+cos(theta))/(2*theta*sin(theta))) * skew(omega)^2 for sin(theta)!=0
+            # If sin(theta) is zero (theta = k*pi), different forms are used.
+            # If theta = pi, V_inv = I - 0.5*skew(omega) + (1/pi^2)*skew(omega)^2
+            
+            # Reverting to previous V_inv which seemed okay, just ensuring omega (not axis) is used where appropriate.
+            # The previous version used omega_skew_axis = skew_symmetric(axis)
+            # and terms like (theta/2)*omega_skew_axis and (omega_skew_axis @ omega_skew_axis)
+            # This is correct application of axis-angle version if axis = omega / theta.
+            axis = omega / theta
+            omega_skew_axis = skew_symmetric(axis)
             V_inv = np.eye(3) - (theta / 2.0) * omega_skew_axis + \
                     (1.0 - term_cot_coeff) * (omega_skew_axis @ omega_skew_axis)
+            
     v_se3 = V_inv @ t_vec
-    return np.concatenate((omega, v_se3))
+    xi = np.concatenate((omega, v_se3))
+    return xi
 
-# --- Minimal OptimizationData ---
 class OptimizationData:
     def __init__(self, inlier_matches_map_us, ego_interpolator_us, K, t_rec_map_us, num_images_with_matches):
         self.inlier_matches = inlier_matches_map_us
         self.ego_interpolator = ego_interpolator_us # Expects query_ts in MICROSECONDS
         self.K = K
         self.t_rec_map = t_rec_map_us # Stores recorded timestamps in MICROSECONDS
-        self.image_indices = sorted(inlier_matches_map_us.keys())
+        self.image_indices = sorted(inlier_matches_map_us.keys()) 
         self.num_opt_images = len(self.image_indices)
 
-        self.all_p2d = []; self.all_P3d = []
-        self.image_idx_to_dt_param_idx_map = {}
+        self.all_p2d = []
+        self.all_P3d = []
+        self.image_idx_to_dt_param_idx_map = {} 
+
         current_dt_param_idx = 0
-        for original_img_idx in self.image_indices:
+        for original_img_idx in self.image_indices: 
             p2d, P3d = self.inlier_matches[original_img_idx]
-            self.all_p2d.append(p2d); self.all_P3d.append(P3d)
+            self.all_p2d.append(p2d)
+            self.all_P3d.append(P3d)
             self.image_idx_to_dt_param_idx_map[original_img_idx] = current_dt_param_idx
             current_dt_param_idx += 1
-        if self.all_p2d:
+
+        if self.all_p2d: 
             self.all_p2d = np.concatenate(self.all_p2d, axis=0)
             self.all_P3d = np.concatenate(self.all_P3d, axis=0)
             self.total_residuals = self.all_p2d.shape[0] * 2
-        else: self.total_residuals = 0
+        else:
+            self.total_residuals = 0
 
 def compute_residuals(X, opt_data: OptimizationData):
     residuals = np.zeros(opt_data.total_residuals, dtype=np.float64)
-    if opt_data.total_residuals == 0: return residuals
+    if opt_data.total_residuals == 0: return residuals 
 
     try:
         xi_ego_cam = X[:6]
-        all_dt_seconds = X[6:] # dt values are optimized in SECONDS
+        all_dt_seconds = X[6:] 
+
         T_ego_cam = se3_to_SE3(xi_ego_cam)
         current_residual_offset = 0
 
         for i in range(opt_data.num_opt_images):
-            original_img_idx = opt_data.image_indices[i]
-            dt_i_seconds = all_dt_seconds[i]
+            original_img_idx = opt_data.image_indices[i] 
+            dt_i_seconds = all_dt_seconds[i] 
+
             p2d_inliers, P3d_inliers = opt_data.inlier_matches[original_img_idx]
             num_matches = p2d_inliers.shape[0]
-            if num_matches == 0: continue
+            if num_matches == 0: continue 
 
             t_rec_i_us = opt_data.t_rec_map[original_img_idx] # This is in MICROSECONDS
 
             # --- SCALE dt TO MICROSECONDS ---
-            dt_i_us = dt_i_seconds * 1_000_000.0 # From seconds to microseconds
-            t_true_i_us = float(t_rec_i_us) + dt_i_us # Float arithmetic for precision
+            dt_i_us = dt_i_seconds * 1_000_000.0 # Corrected scaling
+            t_true_i_us = float(t_rec_i_us) + dt_i_us # Result is in microseconds
 
+            # Interpolate ego pose using the microsecond timestamp
             T_map_ego_i = opt_data.ego_interpolator(t_true_i_us) # ego_interpolator expects microseconds
+            
             if T_map_ego_i is None:
                 logging.warning(f"Ego pose interpolation failed for img_idx {original_img_idx} at t_true_us={t_true_i_us:.0f} (orig t_rec_us={t_rec_i_us}, dt_s={dt_i_seconds:.4f})")
                 residuals[current_residual_offset : current_residual_offset + num_matches * 2] = 1e6
-                current_residual_offset += num_matches * 2; continue
+                current_residual_offset += num_matches * 2
+                continue
 
             T_map_cam_i = T_map_ego_i @ T_ego_cam
-            try: T_cam_map_i = np.linalg.inv(T_map_cam_i)
+            try:
+                T_cam_map_i = np.linalg.inv(T_map_cam_i)
             except np.linalg.LinAlgError:
                 logging.warning(f"Pose inversion failed for img_idx {original_img_idx}")
                 residuals[current_residual_offset : current_residual_offset + num_matches * 2] = 1e6
-                current_residual_offset += num_matches * 2; continue
+                current_residual_offset += num_matches * 2
+                continue
 
             P3d_h = np.hstack((P3d_inliers, np.ones((num_matches, 1))))
             P_cam_h = (T_cam_map_i @ P3d_h.T).T
             valid_depth_mask = P_cam_h[:, 2] > 1e-3
-            p_proj_2d_slice = np.full((num_matches, 2), 1e6)
+            
+            p_proj_2d_slice = np.full((num_matches, 2), 1e6) 
+
             if np.any(valid_depth_mask):
                 P_cam_h_valid = P_cam_h[valid_depth_mask, :3]
                 p_proj_h_valid = (opt_data.K @ P_cam_h_valid.T).T
+                
                 valid_proj_mask_local = np.abs(p_proj_h_valid[:, 2]) > 1e-6
+                
                 if np.any(valid_proj_mask_local):
                     p_proj_2d_final_valid = np.zeros((np.sum(valid_proj_mask_local), 2))
                     p_proj_2d_final_valid[:, 0] = p_proj_h_valid[valid_proj_mask_local, 0] / p_proj_h_valid[valid_proj_mask_local, 2]
                     p_proj_2d_final_valid[:, 1] = p_proj_h_valid[valid_proj_mask_local, 1] / p_proj_h_valid[valid_proj_mask_local, 2]
+                    
                     original_indices_valid_depth = np.where(valid_depth_mask)[0]
                     original_indices_final_valid = original_indices_valid_depth[valid_proj_mask_local]
+                    
                     p_proj_2d_slice[original_indices_final_valid] = p_proj_2d_final_valid
+
             r_i_slice = p2d_inliers - p_proj_2d_slice
             residuals[current_residual_offset : current_residual_offset + num_matches * 2] = r_i_slice.flatten()
             current_residual_offset += num_matches * 2
+
     except Exception as e:
         logging.error(f"Error in compute_residuals: {e}\n{traceback.format_exc()}")
         return np.full(opt_data.total_residuals if opt_data.total_residuals > 0 else 1, 1e6, dtype=np.float64)
+
     if not np.all(np.isfinite(residuals)):
         logging.error("Non-finite values detected in residuals! Replacing with 1e6.")
         residuals[~np.isfinite(residuals)] = 1e6
     return residuals
 
 def compute_residuals_timestamp_only(dt_scalar_seconds, fixed_T_ego_cam, p2d_inliers, P3d_inliers,
-                                     t_rec_us, ego_interpolator_us, K):
+                                     t_rec_us, ego_interpolator_us, K): # Suffixes changed
     num_matches = p2d_inliers.shape[0]
-    residuals_flat = np.zeros(num_matches * 2, dtype=np.float64)
+    residuals_flat = np.zeros(num_matches * 2, dtype=np.float64) 
+
     try:
         dt_value_seconds = dt_scalar_seconds[0] if isinstance(dt_scalar_seconds, np.ndarray) and dt_scalar_seconds.size == 1 else dt_scalar_seconds
+        
         # --- SCALE dt TO MICROSECONDS ---
-        dt_value_us = dt_value_seconds * 1_000_000.0 # From seconds to microseconds
-        t_true_i_us = float(t_rec_us) + dt_value_us # t_rec_us is int64 (microseconds)
+        dt_value_us = dt_value_seconds * 1_000_000.0 # Corrected scaling
+        t_true_i_us = float(t_rec_us) + dt_value_us # Result is in microseconds
 
         T_map_ego_i = ego_interpolator_us(t_true_i_us) # ego_interpolator_us expects microseconds
         if T_map_ego_i is None:
@@ -2456,128 +2549,209 @@ def compute_residuals_timestamp_only(dt_scalar_seconds, fixed_T_ego_cam, p2d_inl
             return np.full(num_matches * 2, 1e6, dtype=np.float64)
 
         T_map_cam_i = T_map_ego_i @ fixed_T_ego_cam
-        try: T_cam_map_i = np.linalg.inv(T_map_cam_i)
+        try:
+            T_cam_map_i = np.linalg.inv(T_map_cam_i)
         except np.linalg.LinAlgError:
             logging.warning("TS_ONLY: Pose inversion failed.")
             return np.full(num_matches * 2, 1e6, dtype=np.float64)
 
         P3d_h = np.hstack((P3d_inliers, np.ones((num_matches, 1))))
         P_cam_h = (T_cam_map_i @ P3d_h.T).T
-        valid_depth_mask = P_cam_h[:, 2] > 1e-3
-        p_proj_2d = np.full((num_matches, 2), 1e6)
+        valid_depth_mask = P_cam_h[:, 2] > 1e-3 
+
+        p_proj_2d = np.full((num_matches, 2), 1e6) 
+
         if np.any(valid_depth_mask):
             P_cam_h_valid = P_cam_h[valid_depth_mask, :3]
-            p_proj_h_valid = (K @ P_cam_h_valid.T).T
-            valid_proj_mask_local = np.abs(p_proj_h_valid[:, 2]) > 1e-6
+            p_proj_h_valid = (K @ P_cam_h_valid.T).T 
+
+            valid_proj_mask_local = np.abs(p_proj_h_valid[:, 2]) > 1e-6 
+
             if np.any(valid_proj_mask_local):
                 p_proj_2d_final_valid = np.zeros((np.sum(valid_proj_mask_local), 2))
                 p_proj_2d_final_valid[:, 0] = p_proj_h_valid[valid_proj_mask_local, 0] / p_proj_h_valid[valid_proj_mask_local, 2]
                 p_proj_2d_final_valid[:, 1] = p_proj_h_valid[valid_proj_mask_local, 1] / p_proj_h_valid[valid_proj_mask_local, 2]
+                
                 original_indices_valid_depth = np.where(valid_depth_mask)[0]
                 original_indices_final_valid = original_indices_valid_depth[valid_proj_mask_local]
                 p_proj_2d[original_indices_final_valid] = p_proj_2d_final_valid
-        r_i = p2d_inliers - p_proj_2d
+        
+        r_i = p2d_inliers - p_proj_2d 
         residuals_flat = r_i.flatten()
+
     except Exception as e:
         logging.error(f"Error in compute_residuals_timestamp_only: {e}\n{traceback.format_exc()}")
         return np.full(num_matches * 2, 1e6, dtype=np.float64)
+
     if not np.all(np.isfinite(residuals_flat)):
         logging.error("Non-finite values detected in timestamp-only residuals! Replacing with 1e6.")
         residuals_flat[~np.isfinite(residuals_flat)] = 1e6
     return residuals_flat
 
-# --- Function for Timestamp-Only Optimization ---
 def refine_timestamp_only(fixed_T_ego_cam, p2d_inliers, P3d_inliers,
-                          t_rec_us, # Expects microsecond timestamp
-                          ego_interpolator_us, # Expects microsecond query_ts
-                          K,
-                          dt_bounds_seconds=(-0.1, 0.1), # Bounds for dt (in seconds)
+                          t_rec_us, ego_interpolator_us, K,
+                          dt_bounds_seconds=(-0.1, 0.1),
                           loss_function='cauchy', verbose=0):
     if p2d_inliers.shape[0] == 0:
         logging.warning("No inliers provided for timestamp-only refinement.")
-        return None
+        # Return values consistent with expected tuple: (dt, status, message, optimality)
+        return None, -1, "No inliers", np.inf
+
     x0_dt_seconds = [0.0]
     bounds_dt_seconds = ([dt_bounds_seconds[0]], [dt_bounds_seconds[1]])
+
     residual_func_partial = functools.partial(
         compute_residuals_timestamp_only,
-        fixed_T_ego_cam=fixed_T_ego_cam, p2d_inliers=p2d_inliers, P3d_inliers=P3d_inliers,
-        t_rec_us=t_rec_us, ego_interpolator_us=ego_interpolator_us, K=K
+        fixed_T_ego_cam=fixed_T_ego_cam,
+        p2d_inliers=p2d_inliers,
+        P3d_inliers=P3d_inliers,
+        t_rec_us=t_rec_us,
+        ego_interpolator_us=ego_interpolator_us,
+        K=K
     )
+
+    dt_val = None
+    status_val = -1 # Default status for pre-optimization
+    message_val = "Optimization not run"
+    optimality_val = np.inf
+
     try:
+        # Calculate initial cost if verbose
+        if verbose > 0:
+            initial_residuals_ts_only = residual_func_partial(x0_dt_seconds)
+            if initial_residuals_ts_only is not None and initial_residuals_ts_only.size > 0:
+                 initial_cost_ts_only = 0.5 * np.sum(initial_residuals_ts_only**2)
+                 logging.info(f"TS-Only for t_rec_us={t_rec_us}: Initial cost (dt=0): {initial_cost_ts_only:.4e}")
+            else:
+                 logging.warning(f"TS-Only for t_rec_us={t_rec_us}: Could not compute initial residuals.")
+
+
         result = least_squares(
-            residual_func_partial, x0_dt_seconds, jac='2-point', bounds=bounds_dt_seconds,
-            method='trf', ftol=1e-8, xtol=1e-8, gtol=1e-8, loss=loss_function,
-            verbose=verbose, max_nfev=200
+            residual_func_partial,
+            x0_dt_seconds,
+            jac='2-point',
+            bounds=bounds_dt_seconds,
+            method='trf',
+            ftol=1e-9, xtol=1e-9, gtol=1e-9, # Slightly tighter tols for 1D
+            loss=loss_function,
+            verbose=verbose, # This is the verbosity for least_squares iterations
+            max_nfev=300 # More NFEV for 1D opt
         )
+
+        status_val = result.status
+        message_val = result.message
+        optimality_val = result.optimality
+
+        # Calculate final cost if verbose
+        if verbose > 0 :
+            final_residuals_ts_only = residual_func_partial(result.x)
+            if final_residuals_ts_only is not None and final_residuals_ts_only.size > 0 :
+                final_cost_ts_only = 0.5 * np.sum(final_residuals_ts_only**2) # or result.cost
+                logging.info(f"TS-Only for t_rec_us={t_rec_us}: Final cost (dt={result.x[0]:.7f}): {final_cost_ts_only:.4e}. Optimality: {result.optimality:.2e}")
+            else:
+                logging.warning(f"TS-Only for t_rec_us={t_rec_us}: Could not compute final residuals for dt={result.x[0]:.7f}")
+
+
         if result.success:
+            dt_val = result.x[0]
+            # This warning is already good
             if result.optimality > 1e-2 and verbose > 0:
-                 logging.warning(f"Timestamp-only opt for t_rec_us={t_rec_us} finished with high optimality: {result.optimality:.2e}")
-            return result.x[0] # Return optimized dt (in SECONDS)
+                 logging.warning(f"TS-Only opt for t_rec_us={t_rec_us} (dt={dt_val:.7f}s) finished with high optimality: {result.optimality:.2e}")
         else:
-            logging.warning(f"Timestamp-only optimization failed for t_rec_us={t_rec_us}. Status: {result.status} ({result.message})")
-            return None
+            # dt_val remains None
+            logging.warning(f"TS-Only optimization FAILED for t_rec_us={t_rec_us}. Status: {result.status} ('{result.message}'), Optimality: {result.optimality:.2e}. Resulting dt (if any): {result.x[0]:.7f}")
+            if np.isclose(result.x[0], 0.0) and result.status != 0 : # If it failed and result is 0.0
+                 logging.warning(f" -> TS-Only for t_rec_us={t_rec_us} failed and dt is 0.0. Cost may not have improved from initial.")
+
+
     except Exception as e:
-        logging.error(f"Timestamp-only optimization failed with error for t_rec_us={t_rec_us}: {e}\n{traceback.format_exc()}")
-        return None
+        logging.error(f"TS-Only optimization CRASHED for t_rec_us={t_rec_us}: {e}\n{traceback.format_exc()}")
+        # dt_val remains None
+        status_val = -100 # Custom status for crash
+        message_val = str(e)
+        optimality_val = np.inf
+
+    return dt_val, status_val, message_val, optimality_val
 
 def refine_extrinsics_and_timestamps(
     initial_T_ego_cam: np.ndarray,
-    inlier_matches_map: dict,
-    ego_timestamps_us: np.ndarray, # Expects microsecond timestamps
-    ego_poses: list,
-    query_indices: list,
-    query_timestamps_rec_us: dict, # Expects {img_idx: recorded_timestamp_us}
+    inlier_matches_map: dict, 
+    ego_timestamps_us: np.ndarray, # RENAMED: Expects microsecond timestamps
+    ego_poses: list, 
+    query_indices: list, 
+    query_timestamps_rec_us: dict, # RENAMED: Expects {img_idx: recorded_timestamp_us}
     camera_intrinsics: np.ndarray,
-    dt_bounds_seconds=(-0.1, 0.1),
-    loss_function='cauchy',
+    dt_bounds_seconds=(-0.1, 0.1), 
+    loss_function='cauchy', 
     verbose=1,
-    interpolation_tolerance_us: int = 1000 # Default to 1 millisecond tolerance
+    interpolation_tolerance_us: int = 1 # RENAMED: Default to 1 microsecond tolerance
 ):
-    logging.info("--- Starting Extrinsics and Timestamp Refinement (Timestamps in MICROSECONDS) ---")
-    num_images_total = len(query_indices)
-    if num_images_total == 0: logging.error("No query images provided."); return None, None, None
+    logging.info("--- Starting Extrinsics and Timestamp Refinement (Timestamps in Microseconds) ---")
 
-    valid_inlier_matches = { idx: data for idx, data in inlier_matches_map.items() if idx in query_indices and data[0].shape[0] > 0 }
+    num_images_total = len(query_indices)
+    if num_images_total == 0:
+        logging.error("No query images provided.")
+        return None, None, None
+
+    valid_inlier_matches = {
+        idx: data for idx, data in inlier_matches_map.items()
+        if idx in query_indices and data[0].shape[0] > 0
+    }
     num_images_with_matches = len(valid_inlier_matches)
-    if num_images_with_matches == 0:
+    if num_images_with_matches == 0: 
         logging.error("No images with valid inlier matches found for optimization.")
         return None, None, None
     logging.info(f"Optimizing using {num_images_with_matches} images with inlier matches out of {num_images_total} specified.")
 
-    try: xi_ego_cam_init = SE3_to_se3(initial_T_ego_cam)
+    try:
+        xi_ego_cam_init = SE3_to_se3(initial_T_ego_cam)
     except Exception as e:
         logging.error(f"Failed to convert initial T_ego_cam to se(3): {e}", exc_info=True)
         return None, None, None
 
-    dt_init_seconds = np.zeros(num_images_with_matches) # dt values are in SECONDS
+    dt_init_seconds = np.zeros(num_images_with_matches) 
     x0 = np.concatenate((xi_ego_cam_init, dt_init_seconds))
-    bounds = ([-np.inf]*6 + [dt_bounds_seconds[0]]*num_images_with_matches, [np.inf]*6 + [dt_bounds_seconds[1]]*num_images_with_matches)
 
-    # Microsecond-aware interpolator with specified tolerance for optimization
-    def interpolate_ego_pose_for_opt(query_ts_us_float):
-        return get_pose_for_timestamp(query_ts_us_float, ego_timestamps_us, ego_poses,
-                                      tolerance_us=interpolation_tolerance_us)
+    bounds_low = [-np.inf] * 6 + [dt_bounds_seconds[0]] * num_images_with_matches
+    bounds_high = [np.inf] * 6 + [dt_bounds_seconds[1]] * num_images_with_matches
+    bounds = (bounds_low, bounds_high)
 
-    filtered_t_rec_map_us = { idx: ts for idx, ts in query_timestamps_rec_us.items() if idx in valid_inlier_matches }
+    # --- Create Ego Pose Interpolator Function (Microsecond Aware) ---
+    def interpolate_ego_pose_for_opt(query_ts_us_float): # Renamed arg
+        # get_pose_for_timestamp expects microsecond query_ts
+        return get_pose_for_timestamp(query_ts_us_float, ego_timestamps_us, ego_poses, 
+                                      tolerance_us=interpolation_tolerance_us) # Pass us tolerance
+
+    filtered_t_rec_map_us = { # Renamed
+        idx: ts for idx, ts in query_timestamps_rec_us.items() 
+        if idx in valid_inlier_matches
+    }
+
     try:
         opt_data = OptimizationData(
-            valid_inlier_matches, interpolate_ego_pose_for_opt, camera_intrinsics,
-            filtered_t_rec_map_us, num_images_with_matches
+            valid_inlier_matches,      
+            interpolate_ego_pose_for_opt, # Microsecond-aware interpolator
+            camera_intrinsics,
+            filtered_t_rec_map_us,      # Microsecond timestamps
+            num_images_with_matches    
         )
     except Exception as e:
          logging.error(f"Failed to create OptimizationData: {e}", exc_info=True)
          return None, None, None
+    
     if opt_data.total_residuals == 0:
-        logging.error("OptimizationData reports zero total residuals. Likely no valid matches.")
-        return initial_T_ego_cam, {idx: 0.0 for idx in query_indices}, None
+        logging.error("OptimizationData reports zero total residuals.")
+        return initial_T_ego_cam, {idx: 0.0 for idx in query_indices}, None 
 
-    logging.info(f"Total parameters: {len(x0)} (6 for T_ego_cam, {num_images_with_matches} for dt in seconds). Residuals: {opt_data.total_residuals}")
+    logging.info(f"Total number of parameters: {len(x0)} (6 for T_ego_cam, {num_images_with_matches} for dt in seconds)")
+    logging.info(f"Total number of residuals: {opt_data.total_residuals}")
+
     try:
         initial_residuals = compute_residuals(x0, opt_data)
         initial_cost = 0.5 * np.sum(initial_residuals**2)
         logging.info(f"Calculated Initial cost: {initial_cost:.4e}")
         if not np.isfinite(initial_cost) or initial_cost > 1e10:
-            logging.error(f"Initial cost non-finite or too large ({initial_cost:.2e}). Check inputs.")
+            logging.error(f"Initial cost is non-finite or extremely large ({initial_cost:.2e})! Check inputs.")
             return None, None, None
     except Exception as e:
         logging.error(f"Failed to compute initial residuals/cost: {e}", exc_info=True)
@@ -2588,77 +2762,68 @@ def refine_extrinsics_and_timestamps(
         result = least_squares(
             compute_residuals, x0, jac='2-point', bounds=bounds, method='trf',
             ftol=1e-8, xtol=1e-8, gtol=1e-8, loss=loss_function, verbose=verbose,
-            max_nfev=1000 * len(x0), args=(opt_data,)
+            max_nfev=1000 * len(x0), 
+            args=(opt_data,)
         )
         duration = time.time() - start_time
-        logging.info(f"Optimization finished in {duration:.2f}s. Status: {result.status} ({result.message}). Final cost: {result.cost:.4e}. Optimality: {result.optimality:.4e}")
+        logging.info(f"Optimization finished in {duration:.2f} seconds. Status: {result.status} ({result.message})")
+        logging.info(f"Final cost: {result.cost:.4e}. Optimality: {result.optimality:.4e}")
     except Exception as e:
         logging.error(f"Optimization crashed: {e}\n{traceback.format_exc()}")
         return None, None, None
 
-    if not result.success and result.status <= 0:
+    if not result.success and result.status <= 0: 
         logging.warning(f"Optimization reported failure or did not converge (status: {result.status}).")
 
     xi_ego_cam_refined = result.x[:6]
-    all_dt_refined_seconds = result.x[6:] # These are in SECONDS
-    try: refined_T_ego_cam = se3_to_SE3(xi_ego_cam_refined)
+    all_dt_refined_seconds = result.x[6:] 
+
+    try:
+        refined_T_ego_cam = se3_to_SE3(xi_ego_cam_refined)
     except Exception as e:
         logging.error(f"Failed to convert refined xi_ego_cam to SE(3): {e}", exc_info=True)
-        return None, None, None
+        return None, None, None 
 
     refined_delta_t_map_seconds = {}
-    for i, original_img_idx in enumerate(opt_data.image_indices):
-         if i < len(all_dt_refined_seconds): refined_delta_t_map_seconds[original_img_idx] = all_dt_refined_seconds[i]
-         else: logging.error(f"CRITICAL: Mismatch in refined_dt array length. Index {i} for len {len(all_dt_refined_seconds)}.")
-    for img_idx in query_indices: # Assign 0.0s for non-optimized images
-        if img_idx not in refined_delta_t_map_seconds: refined_delta_t_map_seconds[img_idx] = 0.0
+    for i, original_img_idx in enumerate(opt_data.image_indices): 
+         if i < len(all_dt_refined_seconds):
+             refined_delta_t_map_seconds[original_img_idx] = all_dt_refined_seconds[i]
+         else: 
+              logging.error(f"CRITICAL: Mismatch in refined_dt array length. Index {i} out of bounds for len {len(all_dt_refined_seconds)}.")
+
+    for img_idx in query_indices:
+        if img_idx not in refined_delta_t_map_seconds:
+            refined_delta_t_map_seconds[img_idx] = 0.0
 
     logging.info(f"Refined T_ego_cam:\n{np.round(refined_T_ego_cam, 4)}")
+    
     optimized_dt_values = [refined_delta_t_map_seconds[idx] for idx in opt_data.image_indices if idx in refined_delta_t_map_seconds]
     if optimized_dt_values:
-         logging.info(f"Refined Delta_t (seconds) stats ({len(optimized_dt_values)} optimized images): Mean={np.mean(optimized_dt_values):.4f}s, Std={np.std(optimized_dt_values):.4f}s, Min={np.min(optimized_dt_values):.4f}s, Max={np.max(optimized_dt_values):.4f}s")
-    if result.optimality > 1e-1:
-        logging.warning(f"High first-order optimality ({result.optimality:.2e}) suggests result might be suboptimal.")
+         logging.info(f"Refined Delta_t (seconds) stats (for {len(optimized_dt_values)} optimized images): Mean={np.mean(optimized_dt_values):.4f}s, Std={np.std(optimized_dt_values):.4f}s, Min={np.min(optimized_dt_values):.4f}s, Max={np.max(optimized_dt_values):.4f}s")
+
+    optimality_threshold = 1e-1 
+    if result.optimality > optimality_threshold:
+        logging.warning(f"High first-order optimality ({result.optimality:.2e}) suggests result might be suboptimal or near constraint boundary.")
+
     return refined_T_ego_cam, refined_delta_t_map_seconds, result
 
-# ==============================================================================
-# Helper function to save poses in COLMAP/HLOC format
-# ==============================================================================
 def save_poses_to_colmap_format(poses_cam_map: dict, output_file: Path):
-    """
-    Saves poses T_cam_map to a text file in COLMAP/HLOC format.
-    Format: image_name qw qx qy qz tx ty tz
-
-    Args:
-        poses_cam_map (dict): Dictionary mapping image name (str) to the
-                              corresponding 4x4 T_cam_map NumPy array.
-        output_file (Path): The Path object for the output text file.
-    """
     logging.info(f"Saving {len(poses_cam_map)} poses to {output_file} in COLMAP format...")
     num_saved = 0
     num_skipped = 0
     try:
-        # Ensure parent directory exists
         output_file.parent.mkdir(parents=True, exist_ok=True)
-
         with output_file.open('w') as f:
-            # Iterate through sorted keys for consistent output order (optional but good practice)
             sorted_image_names = sorted(poses_cam_map.keys())
-
             for img_name in sorted_image_names:
-                T_cam_map_mat = poses_cam_map.get(img_name) # Use .get for safety
-
+                T_cam_map_mat = poses_cam_map.get(img_name)
                 if T_cam_map_mat is None:
                     logging.warning(f"Pose for {img_name} is None. Skipping save.")
                     num_skipped += 1
                     continue
-
                 try:
-                    # Validate shape
                     if not isinstance(T_cam_map_mat, np.ndarray) or T_cam_map_mat.shape != (4, 4):
                         raise ValueError("Pose matrix is not a 4x4 NumPy array")
-
-                    # Extract rotation matrix and check validity before quaternion conversion
                     R_mat = T_cam_map_mat[:3, :3]
                     if not np.allclose(R_mat.T @ R_mat, np.eye(3), atol=1e-4):
                          logging.warning(f"Rotation matrix for {img_name} is not orthogonal. Quaternion might be inaccurate. Skipping save.")
@@ -2668,35 +2833,25 @@ def save_poses_to_colmap_format(poses_cam_map: dict, output_file: Path):
                          logging.warning(f"Rotation matrix for {img_name} has determinant != 1 ({np.linalg.det(R_mat):.4f}). Quaternion might be inaccurate. Skipping save.")
                          num_skipped += 1
                          continue
-
-                    # Convert rotation to quaternion (w, x, y, z)
-                    q = R.from_matrix(R_mat).as_quat() # Scipy quat: [x, y, z, w]
-                    qw, qx, qy, qz = q[3], q[0], q[1], q[2] # Rearrange to w, x, y, z
-
-                    # Extract translation vector
+                    q = R.from_matrix(R_mat).as_quat() 
+                    qw, qx, qy, qz = q[3], q[0], q[1], q[2] 
                     t = T_cam_map_mat[:3, 3]
                     tx, ty, tz = t[0], t[1], t[2]
-
-                    # Write line to file
                     f.write(f"{img_name} {qw} {qx} {qy} {qz} {tx} {ty} {tz}\n")
                     num_saved += 1
-
                 except ValueError as e_val:
                      logging.error(f"Data validation error for {img_name}: {e_val}. Skipping save.")
                      num_skipped += 1
                 except Exception as e_save:
                     logging.error(f"Error formatting/saving pose for {img_name}: {e_save}", exc_info=True)
                     num_skipped += 1
-
         logging.info(f"Poses saved: {num_saved} successful, {num_skipped} skipped.")
-
     except IOError as e:
         logging.error(f"Error writing results file {output_file}: {e}")
     except Exception as e:
         logging.error(f"An unexpected error occurred during results saving: {e}", exc_info=True)
 
 def parse_value(value_str):
-    """Attempts to parse a value string into bool, int, float, or string."""
     value_str = value_str.strip()
     if value_str.endswith(','): value_str = value_str[:-1]
     if value_str.startswith('"') and value_str.endswith('"'): return value_str[1:-1]
@@ -2709,130 +2864,75 @@ def parse_value(value_str):
     return value_str
 
 def parse_camera_configs(config_text):
-    """
-    Parses multi-config text data similar to protobuf text format.
-    Focuses on correct dictionary structure.
-    """
     configs = []
     current_config_data = None
-    dict_stack = [] # Stack holds the dictionaries currently being populated
+    dict_stack = [] 
     lines = config_text.strip().split('\n')
-
     for line_num, line in enumerate(lines):
         line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-
-        # Start of a top-level config block
+        if not line or line.startswith('#'): continue
         if line == 'config {':
-            if dict_stack: # If stack isn't empty, something is wrong
+            if dict_stack: 
                 logging.warning(f"Found 'config {{' while already inside a block at line {line_num + 1}. Ignoring previous state.")
             current_config_data = {}
-            dict_stack = [current_config_data] # Start stack with the root dict
+            dict_stack = [current_config_data] 
             continue
-
-        # End of ANY block
         if line == '}':
             if not dict_stack:
                 logging.warning(f"Found unexpected '}}' at line {line_num + 1}. Ignoring.")
                 continue
-
-            dict_stack.pop() # Pop the dictionary corresponding to the closing brace
-
-            # If the stack is now empty, it means we closed the top-level 'config' block
+            dict_stack.pop() 
             if not dict_stack and current_config_data is not None:
                  configs.append(current_config_data)
-                 current_config_data = None # Reset for the next potential config block
-            continue # Move to the next line
-
-        # We must be inside a block here if dict_stack is not empty
+                 current_config_data = None 
+            continue 
         if not dict_stack:
             logging.warning(f"Found data outside expected block structure at line {line_num + 1}: '{line}'. Ignoring.")
             continue
-
-        # Check for nested block start (e.g., "parameters {")
         match_block = re.match(r'^(\w+)\s*\{$', line)
         if match_block:
             key = match_block.group(1)
             new_dict = {}
-            parent_dict = dict_stack[-1] # Get the current dictionary from stack top
-
-            # Check if key already exists - decide how to handle (error, list, overwrite)
-            # For camera configs, overwriting seems unlikely to be correct. Let's log an error.
+            parent_dict = dict_stack[-1] 
             if key in parent_dict:
                  logging.error(f"Duplicate block key '{key}' found at line {line_num + 1} within the same parent block. Parsing may be incorrect.")
-                 # Optionally, you could try making the value a list and append, but that complicates access later.
-                 # For now, let's just assign, but the error log is important.
-                 # If issues persist, this is a place to investigate the config file format.
-            parent_dict[key] = new_dict   # Add the new dictionary to its parent
-            dict_stack.append(new_dict)   # Push the NEW dictionary onto the stack
+            parent_dict[key] = new_dict   
+            dict_stack.append(new_dict)   
             continue
-
-        # Check for key-value pair (e.g., "x: 1.23")
         match_kv = re.match(r'^(\w+)\s*:\s*(.+)$', line)
         if match_kv:
             key = match_kv.group(1)
             value_str = match_kv.group(2).strip()
             value = parse_value(value_str)
-            current_dict = dict_stack[-1] # Get the dictionary currently being built
-
-            # Check if key already exists
+            current_dict = dict_stack[-1] 
             if key in current_dict:
                  logging.warning(f"Duplicate key '{key}' found at line {line_num + 1}. Overwriting previous value '{current_dict[key]}'.")
-
-            current_dict[key] = value     # Assign the key-value pair
+            current_dict[key] = value     
             continue
-
-        # If the line doesn't match any known pattern inside a block
         logging.warning(f"Could not parse line {line_num + 1}: '{line}'. Ignoring.")
-
-
-    # Final check for unclosed blocks
     if dict_stack:
          logging.warning(f"Reached end of input but parsing stack is not empty: {len(dict_stack)} levels deep. Config file may be truncated or have missing braces.")
-         # If the root dict is still there, maybe append it?
          if current_config_data is not None and dict_stack[0] is current_config_data:
               logging.warning("Appending potentially incomplete last config block.")
               configs.append(current_config_data)
-
-
     return configs
 
-# --- New Wrapper Function ---
 def get_camera_params_from_parsed(all_configs, target_camera_dev):
-    """
-    Finds the target camera in the parsed config list and extracts/formats parameters.
-
-    Args:
-        all_configs (list): List of dictionaries returned by parse_camera_configs.
-        target_camera_dev (str): The name of the camera device to find.
-
-    Returns:
-        A dictionary containing formatted parameters ('T_ego_cam', 'K', 'D', etc.)
-        or None if the camera or required parameters are not found/valid.
-    """
     target_config = None
     for config in all_configs:
-        # Use .get() to safely access potentially missing keys
         if config.get("camera_dev") == target_camera_dev:
             target_config = config
             break
-
     if target_config is None:
         logging.error(f"Camera '{target_camera_dev}' not found in the parsed configuration list.")
         return None
-
     logging.info(f"Found configuration for camera '{target_camera_dev}'. Extracting parameters...")
-
     try:
-        # Navigate the nested dictionary structure safely using .get()
         params = target_config.get("parameters", {})
         extrinsic = params.get("extrinsic", {}).get("sensor_to_cam", {})
         pos = extrinsic.get("position", {})
         orient = extrinsic.get("orientation", {})
         intrinsic = params.get("intrinsic", {})
-
-        # Extract required values
         pos_x = pos.get("x")
         pos_y = pos.get("y")
         pos_z = pos.get("z")
@@ -2840,7 +2940,6 @@ def get_camera_params_from_parsed(all_configs, target_camera_dev):
         quat_qy = orient.get("qy")
         quat_qz = orient.get("qz")
         quat_qw = orient.get("qw")
-
         img_width = intrinsic.get("img_width")
         img_height = intrinsic.get("img_height")
         f_x = intrinsic.get("f_x")
@@ -2849,36 +2948,31 @@ def get_camera_params_from_parsed(all_configs, target_camera_dev):
         o_y = intrinsic.get("o_y")
         k_1 = intrinsic.get("k_1")
         k_2 = intrinsic.get("k_2")
-        k_3 = intrinsic.get("k_3") # May be None
-        k_4 = intrinsic.get("k_4") # May be None
-        p_1 = intrinsic.get("p_1") # May be None
-        p_2 = intrinsic.get("p_2") # May be None
+        k_3 = intrinsic.get("k_3") 
+        k_4 = intrinsic.get("k_4") 
+        p_1 = intrinsic.get("p_1") 
+        p_2 = intrinsic.get("p_2") 
         model_type = intrinsic.get("model_type")
-
-        # --- Validation ---
         required_base_vals = [pos_x, pos_y, pos_z, quat_qx, quat_qy, quat_qz, quat_qw,
                               img_width, img_height, f_x, f_y, o_x, o_y, model_type]
         required_dist_vals = []
-        dist_params_ok = True
-
         if model_type == "KANNALA_BRANDT":
              required_dist_vals = [k_1, k_2, k_3, k_4]
-             if p_1 is None: p_1 = 0.0 # Default tangential to 0 if missing
+             if p_1 is None: p_1 = 0.0 
              if p_2 is None: p_2 = 0.0
         elif model_type == "PINHOLE":
-             required_dist_vals = [k_1, k_2, p_1, p_2]
-             if k_3 is None: k_3 = 0.0 # Default radial k3 to 0 if missing
-             if k_4 is None: k_4 = 0.0 # Not typically used in OpenCV plumb bob, but default
+             required_dist_vals = [k_1, k_2, p_1, p_2] # k3 is often part of this for OpenCV
+             if k_3 is None: k_3 = 0.0 
+             if k_4 is None: k_4 = 0.0
         elif model_type is None:
             logging.error(f"Missing 'model_type' in intrinsic parameters for {target_camera_dev}.")
             return None
         else:
-            logging.warning(f"Unknown camera model '{model_type}'. Attempting KANNALA_BRANDT K1-K4 validation.")
+            logging.warning(f"Unknown camera model '{model_type}'. Assuming KANNALA_BRANDT K1-K4 like validation for distortion.")
             required_dist_vals = [k_1, k_2, k_3, k_4]
             if p_1 is None: p_1 = 0.0
             if p_2 is None: p_2 = 0.0
 
-        # Check if any required value is None
         if any(v is None for v in required_base_vals + required_dist_vals):
              missing_details = {
                  "pos": (pos_x, pos_y, pos_z), "quat": (quat_qx, quat_qy, quat_qz, quat_qw),
@@ -2888,44 +2982,37 @@ def get_camera_params_from_parsed(all_configs, target_camera_dev):
              logging.error(f"Missing one or more required parameters for '{target_camera_dev}'. Check parsed data structure and required fields for model '{model_type}'.")
              logging.error(f"Extracted values (some may be None): {missing_details}")
              return None
-
-
-        # --- Construct T_ego_cam (T_sensor_cam) ---
         rotation = R.from_quat([quat_qx, quat_qy, quat_qz, quat_qw])
         R_mat = rotation.as_matrix()
         t_vec = np.array([pos_x, pos_y, pos_z])
         T_sensor_cam = np.eye(4)
         T_sensor_cam[:3, :3] = R_mat
         T_sensor_cam[:3, 3] = t_vec
-
-        # --- Construct Intrinsics (K matrix and Distortion D) ---
-        K = np.array([[f_x, 0, o_x], [0, f_y, o_y], [0, 0, 1]])
-
+        K_mat = np.array([[f_x, 0, o_x], [0, f_y, o_y], [0, 0, 1]]) # Renamed K to K_mat
+        D_arr = [] # Renamed D to D_arr
         if model_type == "KANNALA_BRANDT":
-             D = np.array([k_1, k_2, k_3, k_4], dtype=np.float64)
+             D_arr = np.array([k_1, k_2, k_3, k_4], dtype=np.float64)
         elif model_type == "PINHOLE":
-             D = np.array([k_1, k_2, p_1, p_2, k_3], dtype=np.float64)
-        else: # Fallback assumption
-             D = np.array([k_1, k_2, k_3, k_4], dtype=np.float64)
-
-        D = D.reshape(-1, 1)
-
+             # OpenCV Pinhole often uses [k1, k2, p1, p2, k3, (k4, k5, k6 optional)]
+             # Assuming up to k3 for now based on typical simple pinhole.
+             D_arr = np.array([k_1, k_2, p_1, p_2, k_3], dtype=np.float64)
+        else: 
+             D_arr = np.array([k_1, k_2, k_3, k_4], dtype=np.float64) # Fallback, may not be correct
+        # D_arr = D_arr.reshape(-1, 1) # Distortion coefficients are usually 1D array (1xN or Nx1)
+                                      # OpenCV functions usually expect (N,) or (1,N) or (N,1)
         logging.info(f"Successfully extracted and formatted parameters for {target_camera_dev}.")
-
         return {
             'T_ego_cam': T_sensor_cam,
-            'img_width': int(img_width), # Ensure int type
-            'img_height': int(img_height), # Ensure int type
-            'K': K,
-            'D': D,
+            'img_width': int(img_width), 
+            'img_height': int(img_height), 
+            'K': K_mat, # Use K_mat
+            'D': D_arr,   # Use D_arr
             'model_type': model_type
         }
-
     except Exception as e:
         logging.error(f"Error formatting parameters for '{target_camera_dev}' after parsing: {e}")
         logging.error(traceback.format_exc())
         return None
-
 
 @dataclass
 class PnPResult:
@@ -2935,740 +3022,424 @@ class PnPResult:
     num_inliers: int
     p2d_inliers: np.ndarray = None
     P3d_inliers: np.ndarray = None
-    initial_T_map_cam: np.ndarray = None # Optional: Store initial PnP pose (Map from Cam)
+    initial_T_map_cam: np.ndarray = None 
 
 def run_pipeline(
     arg_config,
     lidar_map_file: Path,
     query_image_dir: Path,
-    query_image_list_file: Path, # Text file listing query image names
+    query_image_list_file: Path,
     output_dir: Path,
-    render_poses_list, # List of 4x4 numpy arrays for rendering viewpoints
-    ego_pose_file: Path, # Path to the CSV with accurate T_map_ego poses + timestamps
-    initial_T_ego_cam_guess: np.ndarray, # Initial 4x4 np.array guess for ego-to-camera extrinsics
+    render_poses_list,
+    ego_pose_file: Path,
+    initial_T_ego_cam_guess: np.ndarray,
     camera_intrinsics_matrix: np.ndarray,
-    camera_distortion_array: np.ndarray, # Needed for undistortion
+    camera_distortion_array: np.ndarray,
     image_width: int, image_height: int,
-    camera_name_in_list: str, # Name of the camera used in query_image_list_file (e.g., "panoramic_2")
-    # Preprocessing Params
+    camera_name_in_list: str,
     min_height: float = -2.0, voxel_size: float = 0.03, normal_radius: float = 0.15,
     normal_max_nn: int = 50, device: str = "auto",
-    # Rendering Params
-    render_shading_mode: str = 'normal', render_point_size: float = 2, 
-    intensity_highlight_threshold: float = None, # Added intensity threshold
-    # Hloc Params
-    feature_conf='superpoint_aachen', matcher_conf='superglue',
-    # PnP RANSAC params (for getting inliers)
-    distance_threshold_px: float = 30.0, # Used if linking_method is 'distance_match'
+    render_shading_mode: str = 'normal', render_point_size: float = 2,
+    intensity_highlight_threshold: float = None,
+    feature_conf='superpoint_aachen', matcher_conf='superglue', # matcher_conf not used directly
+    distance_threshold_px: float = 30.0,
     pnp_iterations: int = 500, pnp_reprojection_error: float = 5.0,
     pnp_confidence: float = 0.999999, pnp_min_inliers: int = 15,
-    # Global refinement params
-    num_top_images_for_joint_opt: int = 20,
-    dt_bounds_joint_opt: tuple[float, float] = (-0.05, 0.05), # MODIFIED: For joint optimization
-    dt_bounds_ts_only: tuple[float, float] = (-0.1, 0.1), # MODIFIED: For timestamp-only optimization
+    num_top_images_for_joint_opt: int = 0, # MODIFIED: Set to 0 to indicate joint opt on ALL successful PnP
+    dt_bounds_joint_opt: tuple[float, float] = (-0.05, 0.05),
     opt_verbose: int = 1,
     visualize_steps: bool = True,
     num_images_to_visualize: int = 3,
     visualize_map_point_size: float = 1,
     loss_function: str = 'cauchy',
 ):
-    # --- Setup ---
-    output_dir = Path(output_dir) # Ensure output_dir is a Path object
+    global pnp_min_inliers_global_placeholder # For dummy link_matches_via_depth
+    pnp_min_inliers_global_placeholder = pnp_min_inliers
+
+    output_dir = Path(output_dir)
     hloc_out_dir = output_dir / 'hloc'
     query_image_dir_undistorted = hloc_out_dir / 'query_images_undistorted'
     renders_out_dir = output_dir / 'renders'
     render_image_list_path = renders_out_dir / "render_list.txt"
-    results_file = output_dir / f'refined_poses_{camera_name_in_list}.txt' # Include camera name
+    refined_poses_file = output_dir / f'refined_poses_{camera_name_in_list}.txt'
+    refined_extrinsics_file = output_dir / f'refined_extrinsics_{camera_name_in_list}.txt'
+    refined_delta_t_file = output_dir / f'refined_delta_t_{camera_name_in_list}.csv'
     vis_base_output_dir = hloc_out_dir / 'visualizations'
     mask_suffix = "_mask.png"
     mid_data_dir = output_dir / "mid_data_cache"
 
-    # Ensure input paths are Path objects for consistency
     query_image_dir = Path(query_image_dir)
     query_image_list_file = Path(query_image_list_file)
     lidar_map_file = Path(lidar_map_file)
     ego_pose_file = Path(ego_pose_file)
 
-    # Use Path.mkdir()
     output_dir.mkdir(parents=True, exist_ok=True)
     hloc_out_dir.mkdir(parents=True, exist_ok=True)
-    query_image_dir_undistorted.mkdir(parents=True, exist_ok=True) # Needed for undistorted images
-    renders_out_dir.mkdir(parents=True, exist_ok=True) # Keep for masks maybe
+    query_image_dir_undistorted.mkdir(parents=True, exist_ok=True)
+    renders_out_dir.mkdir(parents=True, exist_ok=True)
     vis_base_output_dir.mkdir(parents=True, exist_ok=True)
     mid_data_dir.mkdir(parents=True, exist_ok=True)
 
-    feature_output_base_name = 'feats-superpoint-n4096-r1024' # Base name from config
-    # *** Define SEPARATE feature file paths using Pathlib ***
+    feature_output_base_name = 'feats-superpoint-n4096-r1024'
     features_filename = f"{feature_output_base_name}.h5"
     features_path = hloc_out_dir / features_filename
     matches_output_path = hloc_out_dir / 'distance_matches.h5'
-    # The path for masked render features (could be same as render_features_path if modified in-place)
-    masked_render_features_path = features_path # Still a Path object, modifying in place
+    masked_render_features_path = features_path
     vis_pnp_output_dir = vis_base_output_dir / 'pnp'
     vis_pnp_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- 0. Load Ego Vehicle Poses ---
-    logging.info("--- 1. Loading Ego Vehicle Poses ---")
-    # Use the modified function, no frame name needed
+    logging.info("--- 0. Loading Ego Vehicle Poses ---")
     ego_timestamps_us, ego_poses_list = load_and_prepare_ego_poses(ego_pose_file)
     if ego_timestamps_us is None or ego_poses_list is None:
-        logging.error(f"Failed to load ego poses. Aborting.")
+        logging.error(f"Failed to load ego poses from {ego_pose_file}. Aborting.")
         return
     if len(ego_timestamps_us) != len(ego_poses_list):
          logging.error("Mismatch between loaded ego timestamps and poses count. Aborting.")
          return
     logging.info(f"Loaded {len(ego_timestamps_us)} ego poses.")
 
-    def interpolate_ego_pose_for_opt(query_ts_us, tolerance_us=1000):
+    def interpolate_ego_pose_for_opt_us(query_ts_us, tolerance_us=1):
         return get_pose_for_timestamp(query_ts_us, ego_timestamps_us, ego_poses_list, tolerance_us=tolerance_us)
 
+    # Initialize variables
+    processed_lidar_data_loaded = None
+    rendered_views_info_loaded = None
+    query_image_names = []
+    query_timestamps_rec_us = {}
+    query_name_to_idx = {}
+    query_idx_to_name = {}
+    query_timestamps_rec_us_indexed = {}
+    # Initialize refined_T_ego_cam and final_delta_t_map early
+    refined_T_ego_cam = np.copy(initial_T_ego_cam_guess)
+    final_delta_t_map = {} # Will store {query_idx: dt_seconds}
+    final_refined_poses_cam_map = {} # For final results
+
     if not arg_config.steps or 1 in arg_config.steps:
-        # --- 1. Preprocessing ---
+        # ... (Step 1: Preprocessing & Rendering - code remains the same as previous response) ...
+        logging.info("--- Running Step 1: Preprocessing & Rendering ---")
         try:
-            # Use 'orig' suffix to clarify these are the original processed points
-            # Pass lidar_map_file as Path (or str if the function requires it)
             pcd_tensor, processed_lidar_data = preprocess_lidar_map(
                 lidar_map_file, min_height, normal_radius, normal_max_nn, voxel_size, device
             )
             if pcd_tensor is None: raise RuntimeError("Preprocessing failed.")
         except Exception as e:
-            print(f"FATAL: Preprocessing failed: {e}")
-            return # Assuming this is inside a function
+            logging.error(f"FATAL: Preprocessing failed: {e}", exc_info=True); return
 
-        # --- 2. Meshing & Sampling ---
-        # SKIPPED - We will render pcd_tensor_orig directly
-
-        # --- 3. Rendering (Using Original Points) ---
         rendered_views_info = []
-        # Use Path object with open() - it's supported
-        with open(render_image_list_path, 'w') as f_list:
-            for i, pose in enumerate(render_poses_list):
-                render_name = f"render_{i:05d}"
-                print(f"\n--- Rendering view {i+1}/{len(render_poses_list)} ({render_name})---")
-                render_output = render_geometric_viewpoint_open3d( # Call the modified function
-                    pcd_tensor,
-                    processed_lidar_data,
-                    pose, camera_intrinsics_matrix, image_width, image_height,
-                    shading_mode=render_shading_mode,
-                    # Set point size to 1 for depth accuracy, adjust geom render later if needed visually
-                    point_size=2.0, # <--- Use 1.0 for accurate depth
-                    intensity_highlight_threshold=intensity_highlight_threshold
-                )
-                if render_output:
-                    geom_img_path = renders_out_dir / f"{render_name}.png"
-                    depth_map_path = renders_out_dir / f"{render_name}_depth.npy" # <--- Depth map path
-                    mask_path = renders_out_dir / f"{render_name}_mask.png"
-
-                    cv2.imwrite(str(geom_img_path), render_output['geometric_image'])
-                    np.save(str(depth_map_path), render_output['depth']) # <--- Save depth map
-                    cv2.imwrite(str(mask_path), render_output['render_mask'])
-
-                    f_list.write(f"{geom_img_path.name}\n") # Write geom image name to list
-
-                    rendered_views_info.append({
-                        'name': render_name,
-                        'geometric_image_path': geom_img_path,
-                        'depth_map_path': depth_map_path, # <--- Store depth map path
-                        'mask_path': mask_path,
-                        'pose': render_output['pose']
-                    })
-                else:
-                    print(f"Warning: Failed to render view {i} ({render_name})")
-
-
-        if not rendered_views_info:
-            print("FATAL: No views were rendered successfully.")
-            return # Assuming this is inside a function
-
-        save_ok = save_processed_data(
-            output_dir=mid_data_dir,
-            processed_lidar_data=processed_lidar_data, # KDTree will be lost here if not saved
-            rendered_views_info=rendered_views_info
-        )
+        if not render_poses_list:
+             logging.warning("Render poses list is empty. Skipping rendering step.")
+        else:
+            with open(render_image_list_path, 'w') as f_list:
+                for i, pose in enumerate(render_poses_list):
+                    render_name = f"render_{i:05d}"
+                    logging.info(f"Rendering view {i+1}/{len(render_poses_list)} ({render_name})...")
+                    render_output = render_geometric_viewpoint_open3d(
+                        pcd_tensor, processed_lidar_data, pose, camera_intrinsics_matrix,
+                        image_width, image_height, shading_mode=render_shading_mode,
+                        point_size=render_point_size, intensity_highlight_threshold=intensity_highlight_threshold
+                    )
+                    if render_output:
+                        geom_img_path = renders_out_dir / f"{render_name}.png"
+                        depth_map_path = renders_out_dir / f"{render_name}_depth.npy"
+                        mask_path = renders_out_dir / f"{render_name}_mask.png"
+                        try:
+                            if cv2: # Check if cv2 is available (dummy or real)
+                                cv2.imwrite(str(geom_img_path), render_output['geometric_image'])
+                                cv2.imwrite(str(mask_path), render_output['render_mask'])
+                        except Exception as e: logging.warning(f"Error saving render image/mask with cv2: {e}")
+                        np.save(str(depth_map_path), render_output['depth'])
+                        f_list.write(f"{geom_img_path.name}\n")
+                        rendered_views_info.append({
+                            'name': render_name, 'geometric_image_path': geom_img_path,
+                            'depth_map_path': depth_map_path, 'mask_path': mask_path,
+                            'pose': render_output['pose']
+                        })
+                    else:
+                        logging.warning(f"Failed to render view {i} ({render_name})")
+            if not rendered_views_info and render_poses_list : # Only error if poses were provided but nothing rendered
+                logging.error("FATAL: No views were rendered successfully despite having render poses.")
+                return
+        save_ok = save_processed_data( output_dir=mid_data_dir, processed_lidar_data=processed_lidar_data, rendered_views_info=rendered_views_info )
         if not save_ok: logging.warning("Failed to save intermediate processed data.")
+        processed_lidar_data_loaded = processed_lidar_data
+        rendered_views_info_loaded = rendered_views_info
 
 
     if not arg_config.steps or 2 in arg_config.steps:
-        # --- 4. Hloc Feature Extraction ---
-        # --- 4.0. Undistort Query Images ---
-        # Pass Path objects directly to the function.
-        # Assumes undistort_images_fisheye can handle Path objects. If not, wrap args with str().
-        query_undistortion_ok = undistort_images_fisheye(
-            image_list_path=query_image_list_file,        # Path object
-            original_image_dir=query_image_dir,           # Path object
-            output_image_dir=query_image_dir_undistorted, # Path object
-            K=camera_intrinsics_matrix,
-            D=camera_distortion_array,
-            new_size=(image_width, image_height)
-        )
-
-        if not query_undistortion_ok:
-            logging.error("Query image undistortion failed. Aborting feature extraction.")
-            return
-
-        # --- 4.1. Query Feature Extraction (Using UNDISTORTED images) ---
-        logging.info("\n--- Running Hloc Feature Extraction for UNDISTORTED Query Images ---")
-
-        # Use Path.exists() to check if file exists
-        if features_path.exists():
-            logging.warning(f"Deleting existing query features file: {features_path}")
-            # Use Path.unlink() to remove the file
-            features_path.unlink()
-
-        # *** Check if undistortion was successful before proceeding ***
-        if query_undistortion_ok:
-            logging.info("\n--- Running Hloc Feature Extraction for UNDISTORTED Query Images (direct call) ---")
-            query_extraction_ok = False
-            start_time = time.time()
-            try:
-                # --- Prepare arguments for extract_features.main ---
-                # Assume feature_conf holds the string name like "superpoint_aachen"
-                conf_name = str(feature_conf) # Ensure it's a string
-                if conf_name not in extract_features.confs:
-                    # Handle case where the config name isn't found
-                    raise ValueError(f"Configuration '{conf_name}' not found in hloc.extract_features.confs")
-                conf_dict = extract_features.confs[conf_name]
-
-                logging.info(f"Calling hloc.extract_features.main with config: {conf_name}")
-                logging.info(f"  image_dir: {query_image_dir_undistorted}")
-                logging.info(f"  image_list: {query_image_list_file}")
-                logging.info(f"  export_dir: {hloc_out_dir}")
-                logging.info(f"  feature_path: {features_path}")
-
-                # --- Call the main function directly ---
-                extract_features.main(
-                    conf=conf_dict,                     # Pass the loaded config dictionary
-                    image_dir=query_image_dir_undistorted, # Pass Path object
-                    image_list=query_image_list_file,    # Pass Path object to the list file
-                    export_dir=hloc_out_dir,           # Pass Path object
-                    feature_path=features_path         # Pass Path object
-                )
-
-                # --- Check for success (output file exists) ---
-                if features_path.exists():
-                    query_extraction_ok = True
-                    logging.info(f"hloc.extract_features.main completed successfully.")
-                else:
-                    # This might happen if main runs but fails internally without exception
-                    logging.error(f"hloc.extract_features.main finished, but output file {features_path} was not found!")
-
-            except Exception as e:
-                # Catch general exceptions from the direct call
-                logging.error(f"ERROR during direct call to hloc.extract_features.main for Query:")
-                logging.error(traceback.format_exc()) # Log the full traceback
-
-            logging.info(f"Query extraction finished in {time.time() - start_time:.2f} seconds. Success: {query_extraction_ok}")
-        else:
-            logging.error("Skipping query feature extraction because undistortion failed.")
-            query_extraction_ok = False # Ensure flag is false
-
-        # --- 4.2. Query Feature Visualization (Using UNDISTORTED images) ---
-        if query_extraction_ok:
-            # Pass Path objects to the function (ensure it supports Path or convert to str if needed)
-            visualize_features(
-                h5_feature_path=features_path,
-                image_list_path=query_image_list_file,
-                # *** Use the UNDISTORTED image directory for visualization ***
-                image_base_dir=query_image_dir_undistorted,
-                vis_output_dir=vis_base_output_dir / 'query_undistorted', # Use Path / operator
-                num_to_vis=num_images_to_visualize,
-                prefix="query_undistorted_vis" # Changed prefix
-            )
-        else:
-            logging.warning("Skipping query visualization because extraction failed or was skipped.")
-
-        # --- 4.3. Rendered Feature Extraction ---
-        logging.info("\n--- Running Hloc Feature Extraction for Rendered Images (NO MASKING YET - direct call) ---")
-        render_extraction_ok = False
-        start_time = time.time()
+        # ... (Step 2: Feature Extraction & Masking - code remains the same) ...
+        logging.info("--- Running Step 2: Feature Extraction & Masking ---")
+        query_undistortion_ok = undistort_images_fisheye( image_list_path=query_image_list_file, original_image_dir=query_image_dir, output_image_dir=query_image_dir_undistorted, K=camera_intrinsics_matrix, D=camera_distortion_array, new_size=(image_width, image_height) )
+        if not query_undistortion_ok: logging.error("Query image undistortion failed. Aborting."); return
+        logging.info("Extracting features for UNDISTORTED Query Images...")
+        if features_path.exists(): logging.warning(f"Deleting existing features file: {features_path}"); features_path.unlink()
+        query_extraction_ok = False
         try:
-            # --- Prepare arguments for extract_features.main ---
-            # Reuse the config name/dict from above if it's the same
-            conf_name = str(feature_conf)
-            if conf_name not in extract_features.confs:
-                raise ValueError(f"Configuration '{conf_name}' not found in hloc.extract_features.confs")
-            conf_dict = extract_features.confs[conf_name]
+            conf_dict = extract_features.confs[str(feature_conf)]; extract_features.main( conf=conf_dict, image_dir=query_image_dir_undistorted, image_list=query_image_list_file, export_dir=hloc_out_dir, feature_path=features_path )
+            if features_path.exists(): query_extraction_ok = True
+            else: logging.error(f"Query feature extraction finished, but output file {features_path} not found!")
+        except Exception as e: logging.error(f"ERROR during Query feature extraction:\n{traceback.format_exc()}")
+        if not query_extraction_ok: logging.error("Query feature extraction failed."); return
+        logging.info("Extracting features for Rendered Images...")
+        render_extraction_ok = False
+        if not render_image_list_path.exists(): logging.error(f"Render image list {render_image_list_path} not found. Cannot extract render features."); return
+        try:
+            conf_dict = extract_features.confs[str(feature_conf)]; extract_features.main( conf=conf_dict, image_dir=renders_out_dir, image_list=render_image_list_path, export_dir=hloc_out_dir, feature_path=features_path )
+            render_extraction_ok = True
+        except Exception as e: logging.error(f"ERROR during Render feature extraction:\n{traceback.format_exc()}")
+        if not render_extraction_ok: logging.error("Render feature extraction failed."); return
+        logging.info("Applying masks to rendered features...")
+        masking_completed_ok = apply_masks_to_features( feature_file_path=masked_render_features_path, image_list_path=render_image_list_path, image_base_dir=renders_out_dir, mask_suffix=mask_suffix, neighborhood_size=2 )
+        if not masking_completed_ok: logging.warning("Mask application to features reported failure or errors.")
+        logging.info("Checking and fixing features...")
+        check_fix_ok = check_and_fix_features(features_path, 256)
+        if not check_fix_ok: logging.error("Critical errors found during feature check/fix.")
+        if visualize_steps:
+            visualize_features( h5_feature_path=features_path, image_list_path=query_image_list_file, image_base_dir=query_image_dir_undistorted, vis_output_dir=vis_base_output_dir / 'query_undistorted', num_to_vis=num_images_to_visualize, prefix="query_undistorted_vis" )
+            visualize_features( h5_feature_path=masked_render_features_path, image_list_path=render_image_list_path, image_base_dir=renders_out_dir, vis_output_dir=vis_base_output_dir / 'render_masked', num_to_vis=num_images_to_visualize, prefix="render_masked_vis" )
 
-            logging.info(f"Calling hloc.extract_features.main with config: {conf_name}")
-            logging.info(f"  image_dir: {renders_out_dir}")
-            logging.info(f"  image_list: {render_image_list_path}")
-            logging.info(f"  export_dir: {hloc_out_dir}")
-            logging.info(f"  feature_path: {features_path}") # Output to the same file
-
-            # --- Call the main function directly ---
-            extract_features.main(
-                conf=conf_dict,
-                image_dir=renders_out_dir,         # Use render directory Path
-                image_list=render_image_list_path, # Use render list Path
-                export_dir=hloc_out_dir,           # Use hloc dir Path
-                feature_path=features_path         # Use feature file Path
-            )
-
-            # --- Check for success (output file exists/updated) ---
-            # Note: Since we write to the same file, checking existence alone might not
-            # be sufficient if query extraction failed but created the file.
-            # Checking modification time or assuming success if no exception occurred might be better.
-            # For simplicity, we'll keep the existence check, assuming main() would raise an error on failure.
-            if features_path.exists():
-                render_extraction_ok = True
-                logging.info(f"hloc.extract_features.main completed successfully.")
-            else:
-                logging.error(f"hloc.extract_features.main finished, but output file {features_path} was somehow not found!")
-
-        except Exception as e:
-            # Catch general exceptions
-            logging.error(f"ERROR during direct call to hloc.extract_features.main for Renders:")
-            logging.error(traceback.format_exc()) # Log the full traceback
-
-        logging.info(f"Render extraction finished in {time.time() - start_time:.2f} seconds. Success: {render_extraction_ok}")
-
-        # --- 4.4. Apply Masks to Rendered Features (Post-Extraction) ---
-        masking_completed_ok = False
-        if render_extraction_ok: # Only proceed if extraction was definitely successful
-            # Pass Path objects directly to the masking function.
-            # Assumes apply_masks_to_features can handle Path objects. If not, wrap args with str().
-            masking_completed_ok = apply_masks_to_features(
-                feature_file_path=masked_render_features_path, # Path object
-                image_list_path=render_image_list_path,        # Path object
-                image_base_dir=renders_out_dir,                # Path object
-                mask_suffix=mask_suffix,
-                neighborhood_size=2 # Example parameter
-            )
-        else:
-            logging.error("Skipping mask application because render extraction failed or feature file potentially missing/incomplete.")
-
-        # --- 4.4.5. Check and Fix Features
-        check_fix_ok = False
-        if masking_completed_ok:
-            # Define the expected descriptor dimension based on the feature type used
-            # For SuperPoint, it's typically 256
-            expected_dim = 256 # Adjust if using a different feature extractor
-            check_fix_ok = check_and_fix_features(features_path, expected_dim)
-            if not check_fix_ok:
-                logging.error("Critical errors found during query feature check/fix. Subsequent steps might fail.")
-                # Decide how to proceed: maybe halt execution, or just log the error and continue cautiously.
-                # For now, we just log and rely on subsequent steps potentially failing.
-        else:
-            logging.warning("Skipping feature check/fix because mask application failed or was skipped.")
-
-        # --- 4.5. Rendered Feature Visualization (After Masking) ---
-        if masking_completed_ok: # Visualize only if masking function returned True
-            # Pass Path objects directly to the visualization function.
-            # Assumes visualize_features can handle Path objects. If not, wrap args with str().
-            visualize_features(
-                h5_feature_path=masked_render_features_path, # Path object
-                image_list_path=render_image_list_path,      # Path object
-                image_base_dir=renders_out_dir,              # Path object
-                # Use Path / operator for joining paths
-                vis_output_dir=vis_base_output_dir / 'render_masked', # Path object
-                num_to_vis=num_images_to_visualize,
-                prefix="render_masked_vis"
-            )
-        elif render_extraction_ok: # If extraction worked but masking failed
-            logging.warning("Skipping visualization of masked render features because masking step failed or reported errors.")
-            # Optionally visualize the *unmasked* renders here if needed for debug:
-            visualize_features(
-                h5_feature_path=features_path, # Use original unmasked path
-                image_list_path=render_image_list_path,
-                image_base_dir=renders_out_dir,
-                vis_output_dir=vis_base_output_dir / 'render_unmasked', # Different output dir
-                num_to_vis=num_images_to_visualize,
-                prefix="render_unmasked_vis"
-            )
-        else: # If extraction didn't even work
-            logging.warning("Skipping render visualization because feature file was not created or extraction failed.")
 
     if not arg_config.steps or 3 in arg_config.steps:
-        # --- 5. Hloc Feature Matching (REPLACED with Distance Matching) ---
-        print("\n--- Running Simple Distance-Based Feature Matching ---")
+        logging.info("--- Running Step 3: Matching, PnP & Joint Refinement ---")
+        # --- 3.1 Matching ---
+        logging.info("Running Distance-Based Feature Matching...")
+        if not features_path.exists(): logging.error(f"Feature file missing: {features_path}. Cannot match."); return
+        if not render_image_list_path.exists(): logging.error(f"Render image list {render_image_list_path} not found. Cannot match."); return
+        if matches_output_path.exists(): logging.warning(f"Deleting existing matches file: {matches_output_path}"); matches_output_path.unlink()
+        matching_ok = match_by_distance( features_path=features_path, query_image_list_file=query_image_list_file, render_image_list_file=render_image_list_path, matches_output_path=matches_output_path, distance_threshold_px=distance_threshold_px )
+        if not matching_ok: logging.error("Distance matching failed."); return
 
-        # Check if features file exists
-        if not features_path.exists():
-            logging.error(f"Feature file missing: {features_path}. Cannot perform distance matching.")
-            # return or exit
-            exit()
-
-        # Delete existing matches file if needed
-        if matches_output_path.exists():
-            logging.warning(f"Deleting existing distance matches file: {matches_output_path}")
-            matches_output_path.unlink()
-
-        # --- Call the Distance Matching Function ---
-        matching_ok = match_by_distance(
-            features_path=features_path,
-            query_image_list_file=query_image_list_file,
-            render_image_list_file=render_image_list_path,
-            matches_output_path=matches_output_path,
-            distance_threshold_px=distance_threshold_px
-        )
-        # -----------------------------------------
-
-        if not matching_ok:
-            logging.error("Distance matching failed. Skipping subsequent steps.")
-            # return or exit
-            exit()
-
-        # --- 6. Linking & 7. Initial Pose Estimation (PnP Loop) ---
-        # --- MODIFIED TO COLLECT ALL PnP RESULTS ---
-        logging.info("\n--- 6/7. Linking Matches and Estimating Initial Poses via PnP ---")
-
-        # Load necessary data (ensure mid_data_dir exists and has the data)
-        # ... (load processed_lidar_data_loaded, rendered_views_info_loaded) ...
-        # ... (handle potential loading errors) ...
-        processed_lidar_data_loaded, rendered_views_info_loaded = load_processed_data(
-            output_dir=mid_data_dir, rebuild_kdtree=True
-        )
+        # --- 3.2 Load Data (if needed) ---
         if processed_lidar_data_loaded is None or rendered_views_info_loaded is None:
-            logging.error("Failed to load processed data. Cannot continue."); return # or exit()
-        if 'kdtree' not in processed_lidar_data_loaded or processed_lidar_data_loaded['kdtree'] is None:
-            logging.error("KDTree is missing from loaded processed data. Cannot perform linking."); return # or exit()
+             logging.info("Loading processed data for PnP...")
+             processed_lidar_data_loaded, rendered_views_info_loaded = load_processed_data( output_dir=mid_data_dir, rebuild_kdtree=True )
+             if processed_lidar_data_loaded is None or rendered_views_info_loaded is None: logging.error("Failed to load processed data for PnP."); return
+             if 'kdtree' not in processed_lidar_data_loaded or processed_lidar_data_loaded['kdtree'] is None: logging.error("KDTree missing from loaded data."); return
 
-
-        # Read query names and setup mappings
-        query_image_names = []
-        query_timestamps_rec_us = {}
-        query_name_to_idx = {}
-        query_idx_to_name = {}
+        # --- 3.3 Prepare Query Info ---
+        logging.info("Reading query image list and parsing timestamps...")
         try:
+            query_image_names.clear(); query_timestamps_rec_us.clear(); query_name_to_idx.clear(); query_idx_to_name.clear(); query_timestamps_rec_us_indexed.clear()
             raw_query_names = [line.strip() for line in query_image_list_file.read_text().splitlines() if line.strip()]
             for i, name in enumerate(raw_query_names):
-                try:
-                    ts = int(Path(name).stem)
-                    query_image_names.append(name) # Add to filtered list
-                    query_timestamps_rec_us[name] = ts
-                    query_name_to_idx[name] = i
-                    query_idx_to_name[i] = name
-                except ValueError:
-                    logging.warning(f"Could not parse timestamp from query image name: {name}. Skipping this image.")
-            if not query_image_names:
-                logging.error("No query images with parseable timestamps found.")
-                return
-            logging.info(f"Processing {len(query_image_names)} query images with valid timestamps.")
-        except Exception as e:
-            logging.error(f"Error reading query image list or parsing timestamps: {e}", exc_info=True)
-            return
-        
-        # Create query_timestamps_rec_indexed, mapping query_idx to timestamp
-        query_timestamps_rec_us_indexed = {}
-        if query_image_names:
-            query_timestamps_rec_us_indexed = {
-                query_name_to_idx[name]: ts
-                for name, ts in query_timestamps_rec_us.items()
-                if name in query_name_to_idx # Ensure name exists in map
-            }
-        if not query_timestamps_rec_us_indexed and query_image_names:
-             logging.warning("Could not create indexed timestamp records, though query images exist.")
+                try: ts_us = int(Path(name).stem); query_image_names.append(name); query_timestamps_rec_us[name] = ts_us; query_name_to_idx[name] = i; query_idx_to_name[i] = name
+                except ValueError: logging.warning(f"Could not parse timestamp from {name}. Skipping.")
+            if not query_image_names: logging.error("No query images with parseable timestamps found."); return
+            query_timestamps_rec_us_indexed = { query_name_to_idx[name]: ts_us for name, ts_us in query_timestamps_rec_us.items() if name in query_name_to_idx }
+            if len(query_timestamps_rec_us_indexed) != len(query_image_names): logging.warning("Mismatch creating indexed timestamp map.")
+        except Exception as e: logging.error(f"Error reading query list/parsing timestamps: {e}", exc_info=True); return
 
+        # --- 3.4 Initial Visualizations (Optional) ---
         if visualize_steps:
-            logging.info(f"--- Generating Initial Map Projection Visualizations ({num_images_to_visualize} images) ---")
-            vis_count = 0
+             logging.info(f"Generating Initial Map Projection Visualizations ({num_images_to_visualize} images)...")
+             vis_count = 0
+             # Ensure render_poses_list is available and has entries
+             if not render_poses_list:
+                 logging.warning("render_poses_list is empty, cannot generate initial visualizations.")
+             else:
+                 for query_idx in sorted(query_idx_to_name.keys()):
+                     if vis_count >= num_images_to_visualize: break
+                     query_name = query_idx_to_name.get(query_idx)
+                     if not query_name or query_idx >= len(render_poses_list): continue
+                     T_map_cam_initial = render_poses_list[query_idx]
+                     if T_map_cam_initial is None: continue
+                     try: T_cam_map_initial = np.linalg.inv(T_map_cam_initial)
+                     except np.linalg.LinAlgError: continue
+                     img_path = query_image_dir_undistorted / query_name
+                     if not img_path.exists(): continue
+                     vis_proj_path = vis_pnp_output_dir / f"{Path(query_name).stem}_{camera_name_in_list}_initial.jpg"
+                     try:
+                         visualize_map_projection(str(img_path), processed_lidar_data_loaded, camera_intrinsics_matrix, T_cam_map_initial, str(vis_proj_path), None, visualize_map_point_size)
+                         vis_count += 1
+                     except Exception as e_vis: logging.error(f"Error visualizing initial map projection for {query_name}: {e_vis}", exc_info=True)
+                 logging.info(f"Finished generating {vis_count} initial visualizations.")
 
-            # Iterate through the query images using their indices to match render_poses_list
-            # Assumes the order in query_image_list matches the order of render_poses_list
-            for query_idx in sorted(query_idx_to_name.keys()): # Iterate 0, 1, 2...
-                if vis_count >= num_images_to_visualize:
-                    logging.info(f"Reached initial visualization limit ({num_images_to_visualize}).")
-                    break
 
-                query_name = query_idx_to_name.get(query_idx)
-                if not query_name: continue # Should not happen if keys are sorted
-
-                # Check if index is valid for render_poses_list
-                if query_idx >= len(render_poses_list):
-                    logging.warning(f"Initial pose index {query_idx} out of bounds for render_poses_list (size {len(render_poses_list)}). Skipping initial visualization for {query_name}.")
-                    continue
-
-                T_map_cam_initial = render_poses_list[query_idx] # Get T_map_cam
-                if T_map_cam_initial is None:
-                    logging.warning(f"Initial pose for index {query_idx} ({query_name}) is None. Skipping initial visualization.")
-                    continue
-
-                # Calculate T_cam_map required for projection
-                try:
-                    T_cam_map_initial = np.linalg.inv(T_map_cam_initial)
-                except np.linalg.LinAlgError:
-                    logging.warning(f"Could not invert initial pose for {query_name}. Skipping initial visualization.")
-                    continue
-
-                img_path = query_image_dir_undistorted / query_name
-                if not img_path.exists():
-                    logging.warning(f"Cannot visualize: Undistorted image not found at {img_path}")
-                    continue
-
-                # Define output path for this visualization
-                vis_proj_path = vis_pnp_output_dir / f"{Path(query_name).stem}_{camera_name_in_list}_initial.jpg"
-                logging.debug(f"Generating initial visualization for {query_name} -> {vis_proj_path}")
-
-                try:
-                    # Ensure visualize_map_projection function is defined/imported
-                    visualize_map_projection(
-                        query_image_path=str(img_path),
-                        processed_lidar_data=processed_lidar_data_loaded, # Pass the dict with 'points'
-                        camera_intrinsics=camera_intrinsics_matrix,
-                        pose_cam_from_map=T_cam_map_initial, # Pass the initial T_cam_map
-                        output_path=str(vis_proj_path),
-                        dist_coeffs=None, # Using undistorted images
-                        point_size=visualize_map_point_size,
-                        max_vis_points=500000,
-                        filter_distance=100.0
-                    )
-                    vis_count += 1
-                except NameError:
-                    logging.error("`visualize_map_projection` function not found. Cannot generate initial visualization.")
-                    break # Stop trying if function is missing
-                except Exception as e_vis:
-                    logging.error(f"Error visualizing initial map projection for {query_name}: {e_vis}", exc_info=True)
-
-            logging.info(f"Finished generating {vis_count} initial visualizations.")
-
-        # --- Run PnP Loop for ALL images ---
+        # --- 3.5 PnP Loop ---
+        logging.info(f"Running PnP RANSAC (min_inliers: {pnp_min_inliers})...")
         all_pnp_results: list[PnPResult] = []
-        nn_distance_threshold = voxel_size * 2.0 # Example
-
+        nn_distance_threshold = voxel_size * 2.0
         for query_name in query_image_names:
-            logging.info(f"\n=== Processing Query Image (PnP Stage): {query_name} ===")
+            logging.debug(f"PnP for: {query_name}")
             query_idx = query_name_to_idx[query_name]
-            query_img_full_path = query_image_dir_undistorted / query_name
-
-            # --- Linking ---
-            query_kps_np, map_points_3d_np = link_matches_via_depth(
-                query_image_name=query_name, features_path=features_path, matches_path=matches_output_path,
-                rendered_views_info=rendered_views_info_loaded, processed_lidar_data=processed_lidar_data_loaded,
-                camera_intrinsics=camera_intrinsics_matrix, nn_distance_threshold=nn_distance_threshold
-            )
-
+            # Ensure rendered_views_info_loaded and processed_lidar_data_loaded are valid
+            if rendered_views_info_loaded is None or processed_lidar_data_loaded is None:
+                logging.error("Rendered views or processed LiDAR data not loaded. Cannot link matches."); break
+            query_kps_np, map_points_3d_np = link_matches_via_depth( query_image_name=query_name, features_path=features_path, matches_path=matches_output_path, rendered_views_info=rendered_views_info_loaded, processed_lidar_data=processed_lidar_data_loaded, camera_intrinsics=camera_intrinsics_matrix, nn_distance_threshold=nn_distance_threshold )
             if query_kps_np.shape[0] < pnp_min_inliers:
-                logging.warning(f"Not enough initial links ({query_kps_np.shape[0]} < {pnp_min_inliers}) for {query_name}. Skipping PnP.")
-                all_pnp_results.append(PnPResult(query_idx, query_name, success=False, num_inliers=query_kps_np.shape[0]))
-                continue
-
-            # --- PnP RANSAC ---
+                all_pnp_results.append(PnPResult(query_idx, query_name, False, query_kps_np.shape[0])); continue
             try:
-                success, rvec, tvec, inliers = cv2.solvePnPRansac(
-                    objectPoints=map_points_3d_np.astype(np.float32), imagePoints=query_kps_np.astype(np.float32),
-                    cameraMatrix=camera_intrinsics_matrix, distCoeffs=None, iterationsCount=pnp_iterations,
-                    reprojectionError=pnp_reprojection_error, confidence=pnp_confidence, flags=cv2.SOLVEPNP_SQPNP
-                )
-
-                if success and inliers is not None and len(inliers) >= pnp_min_inliers:
-                    inlier_indices = inliers.flatten()
-                    p2d_inliers = query_kps_np[inlier_indices]
-                    P3d_inliers = map_points_3d_np[inlier_indices]
-
-                    # Calculate initial pose T_map_cam (optional, for reference)
-                    T_map_cam_pnp = None
-                    try:
-                        R_mat_pnp, _ = cv2.Rodrigues(rvec)
-                        T_cam_map_pnp = np.eye(4); T_cam_map_pnp[:3, :3] = R_mat_pnp; T_cam_map_pnp[:3, 3] = tvec.flatten()
-                        T_map_cam_pnp = np.linalg.inv(T_cam_map_pnp)
-                    except np.linalg.LinAlgError: pass # Ignore inversion failure for initial pose
-
-                    all_pnp_results.append(PnPResult(
-                        query_idx, query_name, success=True, num_inliers=len(inliers),
-                        p2d_inliers=p2d_inliers, P3d_inliers=P3d_inliers, initial_T_map_cam=T_map_cam_pnp
-                    ))
-                    logging.info(f" PnP successful for {query_name}. Inliers: {len(inliers)} / {query_kps_np.shape[0]}")
-
-                else: # PnP failed or too few inliers
-                     num_found_inliers = len(inliers) if inliers is not None else 0
-                     logging.warning(f"PnP failed or insufficient inliers ({num_found_inliers} < {pnp_min_inliers}) for {query_name}. Success={success}")
-                     all_pnp_results.append(PnPResult(query_idx, query_name, success=False, num_inliers=num_found_inliers))
-
-            except (cv2.error, Exception) as e:
-                logging.error(f"Error during PnP for {query_name}: {e}", exc_info=True)
-                all_pnp_results.append(PnPResult(query_idx, query_name, success=False, num_inliers=0))
-
-        # --- Filter successful PnP results ---
+                # Ensure cv2.solvePnPRansac is available
+                if not cv2 or not hasattr(cv2, 'solvePnPRansac'):
+                    logging.error("cv2.solvePnPRansac not available. Cannot perform PnP."); break
+                success, rvec, tvec, inliers = cv2.solvePnPRansac( map_points_3d_np.astype(np.float32), query_kps_np.astype(np.float32), camera_intrinsics_matrix, None, iterationsCount=pnp_iterations, reprojectionError=pnp_reprojection_error, confidence=pnp_confidence, flags=getattr(cv2, 'SOLVEPNP_SQPNP', 0) )
+                num_found_inliers = len(inliers) if inliers is not None else 0
+                if success and num_found_inliers >= pnp_min_inliers:
+                    # ... (store PnP result as before) ...
+                    inlier_indices = inliers.flatten(); p2d_inliers = query_kps_np[inlier_indices]; P3d_inliers = map_points_3d_np[inlier_indices]
+                    T_map_cam_pnp = None # Initialize
+                    try: R_mat_pnp, _ = cv2.Rodrigues(rvec); T_cam_map_pnp = np.eye(4); T_cam_map_pnp[:3,:3] = R_mat_pnp; T_cam_map_pnp[:3,3] = tvec.flatten(); T_map_cam_pnp = np.linalg.inv(T_cam_map_pnp)
+                    except Exception: pass # Catch broad errors during inv/rodrigues
+                    all_pnp_results.append(PnPResult(query_idx, query_name, True, num_found_inliers, p2d_inliers, P3d_inliers, T_map_cam_pnp))
+                else: all_pnp_results.append(PnPResult(query_idx, query_name, False, num_found_inliers))
+            except Exception as e: logging.error(f"Error during PnP for {query_name}: {e}", exc_info=True); all_pnp_results.append(PnPResult(query_idx, query_name, False, 0))
         successful_pnp = [res for res in all_pnp_results if res.success]
-        if not successful_pnp:
-            logging.error("PnP failed for all images. Cannot proceed with refinement.")
-            return
+        if not successful_pnp: logging.error("PnP failed for ALL images. Cannot proceed with refinement."); return
         logging.info(f"PnP successful for {len(successful_pnp)} out of {len(query_image_names)} images.")
 
-        # --- 8. Staged Refinement ---
-        refined_T_ego_cam = np.copy(initial_T_ego_cam_guess) # Initialize with guess
-        logging.info(f"Initial T_ego_cam for refinement stages:\n{np.round(refined_T_ego_cam, 4)}")
+        # --- 3.6 Joint Refinement on ALL PnP-successful images ---
+        # `refined_T_ego_cam` initialized with `initial_T_ego_cam_guess` already
+        if successful_pnp:
+            logging.info(f"--- Running Joint Extrinsic and Timestamp Refinement on ALL {len(successful_pnp)} PnP-successful Images ---")
+            joint_opt_inlier_matches = {res.query_idx: (res.p2d_inliers, res.P3d_inliers) for res in successful_pnp}
+            joint_opt_indices = [res.query_idx for res in successful_pnp]
+            joint_opt_timestamps_rec_us = {idx: query_timestamps_rec_us_indexed[idx] for idx in joint_opt_indices if idx in query_timestamps_rec_us_indexed}
 
-        # --- 8.1 Select Top-K Images for Joint Optimization ---
-        successful_pnp.sort(key=lambda x: x.num_inliers, reverse=True)
-        num_joint = min(num_top_images_for_joint_opt, len(successful_pnp))
-        top_k_results_for_joint_opt = successful_pnp[:num_joint]
+            if len(joint_opt_timestamps_rec_us) != len(joint_opt_indices):
+                 logging.warning("Timestamp records missing for some PnP-successful images. Joint opt will use available ones.")
+                 valid_joint_opt_indices = list(joint_opt_timestamps_rec_us.keys())
+                 joint_opt_inlier_matches = {idx: joint_opt_inlier_matches[idx] for idx in valid_joint_opt_indices}
+                 joint_opt_indices = valid_joint_opt_indices
 
-        # --- 8.2 Run Joint Optimization on Top-K (if configured and possible) ---
-        if num_top_images_for_joint_opt > 0 and top_k_results_for_joint_opt:
-            logging.info(f"--- Running Joint Extrinsic and Timestamp Refinement (Top-{len(top_k_results_for_joint_opt)} Images) ---")
-            top_k_inlier_matches = {res.query_idx: (res.p2d_inliers, res.P3d_inliers) for res in top_k_results_for_joint_opt}
-            top_k_indices = [res.query_idx for res in top_k_results_for_joint_opt]
-            
-            # Ensure timestamps are available for these specific indices
-            top_k_timestamps_rec_us = {idx: query_timestamps_rec_us_indexed[idx] for idx in top_k_indices if idx in query_timestamps_rec_us_indexed}
-
-            if len(top_k_timestamps_rec_us) != len(top_k_indices):
-                logging.warning(f"Timestamp records missing for some top-K images. Joint opt will use {len(top_k_timestamps_rec_us)} images.")
-                valid_top_k_indices = list(top_k_timestamps_rec_us.keys())
-                top_k_inlier_matches = {idx: top_k_inlier_matches[idx] for idx in valid_top_k_indices}
-                top_k_indices = valid_top_k_indices
-            
-            if top_k_indices: # Proceed if there are still images for joint opt
-                joint_opt_T_ego_cam, _, joint_opt_result = refine_extrinsics_and_timestamps(
-                    initial_T_ego_cam=initial_T_ego_cam_guess, # Start joint opt from initial guess
-                    inlier_matches_map=top_k_inlier_matches,
+            if joint_opt_indices: # Proceed if there are images for joint opt
+                opt_T_ego_cam, opt_delta_t_map, joint_opt_result_obj = refine_extrinsics_and_timestamps(
+                    initial_T_ego_cam=initial_T_ego_cam_guess, # Always start from the initial guess
+                    inlier_matches_map=joint_opt_inlier_matches,
                     ego_timestamps_us=ego_timestamps_us,
                     ego_poses=ego_poses_list,
-                    query_indices=top_k_indices,
-                    query_timestamps_rec_us=top_k_timestamps_rec_us,
+                    query_indices=joint_opt_indices, # Pass only indices of images being optimized
+                    query_timestamps_rec_us=joint_opt_timestamps_rec_us,
                     camera_intrinsics=camera_intrinsics_matrix,
-                    dt_bounds_seconds=dt_bounds_joint_opt, # Use joint opt bounds
+                    dt_bounds_seconds=dt_bounds_joint_opt,
                     loss_function=loss_function,
                     verbose=opt_verbose,
+                    interpolation_tolerance_us=1
                 )
-                if joint_opt_T_ego_cam is not None:
-                    refined_T_ego_cam = joint_opt_T_ego_cam # Update with the result of joint opt
-                    logging.info("Joint refinement successful.")
-                    logging.info(f"Refined T_ego_cam (from top-{len(top_k_results_for_joint_opt)} images):\n{np.round(refined_T_ego_cam, 4)}")
+                if opt_T_ego_cam is not None:
+                    refined_T_ego_cam = opt_T_ego_cam # Update the global T_ego_cam
+                    # opt_delta_t_map contains dt for PnP-successful images.
+                    # Update final_delta_t_map with these.
+                    for q_idx, dt_val in opt_delta_t_map.items():
+                        if q_idx in joint_opt_indices: # Ensure it was part of this optimization
+                            final_delta_t_map[q_idx] = dt_val
+                    logging.info("Joint refinement successful for PnP-successful images.")
+                    logging.info(f"Refined T_ego_cam:\n{np.round(refined_T_ego_cam, 6)}")
+                    # Log stats for the dts that were actually optimized
+                    optimized_dt_values_from_joint = [dt for idx, dt in final_delta_t_map.items() if idx in joint_opt_indices]
+                    if optimized_dt_values_from_joint:
+                        logging.info(f"Refined Delta_t (seconds) from joint opt (for {len(optimized_dt_values_from_joint)} images): Mean={np.mean(optimized_dt_values_from_joint):.6f}s, Std={np.std(optimized_dt_values_from_joint):.6f}s, Min={np.min(optimized_dt_values_from_joint):.6f}s, Max={np.max(optimized_dt_values_from_joint):.6f}s")
+
+                    # Check optimality from joint_opt_result_obj
+                    if joint_opt_result_obj and joint_opt_result_obj.optimality > 1e-1: # Stricter check for final run
+                        logging.warning(f"Joint optimization finished with high optimality ({joint_opt_result_obj.optimality:.2e}). Results might be suboptimal.")
+
                 else:
-                    logging.warning("Joint refinement failed. Using initial T_ego_cam guess for subsequent timestamp-only optimization.")
+                    logging.error("Joint refinement FAILED. `refined_T_ego_cam` will remain the initial guess, and `dt` for PnP-successful images will effectively be 0 from this stage.")
+                    # In this case, refined_T_ego_cam is still initial_T_ego_cam_guess.
+                    # final_delta_t_map will not be updated for PnP-successful images here,
+                    # they will get 0.0 in the next step.
             else:
-                logging.warning("No valid images for joint optimization after timestamp check. Skipping joint opt.")
-        elif num_top_images_for_joint_opt > 0 and not top_k_results_for_joint_opt:
-            logging.warning(f"Joint optimization requested (num_top_images_for_joint_opt={num_top_images_for_joint_opt}), but no PnP successful images available. Using initial T_ego_cam guess.")
-        else: # num_top_images_for_joint_opt == 0
-            logging.info("Skipping joint extrinsic refinement as num_top_images_for_joint_opt is 0. Using initial T_ego_cam guess.")
+                logging.warning("No valid images (with timestamps) for joint optimization among PnP-successful ones. `T_ego_cam` remains initial guess.")
+        else:
+            logging.warning("No PnP-successful images. Skipping joint refinement. `T_ego_cam` remains initial guess.")
 
-        # --- 8.3 Run Timestamp-Only Optimization for ALL PnP-successful images ---
-        logging.info(f"--- Running Timestamp-Only Refinement for ALL {len(successful_pnp)} PnP-successful Images ---")
-        final_delta_t_map = {}
-        failed_ts_only_count = 0
-
-        for res in successful_pnp: # Iterate over ALL PnP successful results
-            logging.debug(f"Refining timestamp for image {res.query_name} (idx: {res.query_idx})")
-            if res.query_idx not in query_timestamps_rec_us_indexed:
-                logging.warning(f"Timestamp record missing for query_idx {res.query_idx} ({res.query_name}). Assigning dt=0.")
-                final_delta_t_map[res.query_idx] = 0.0
-                failed_ts_only_count += 1
-                continue
-
-            t_rec_us = query_timestamps_rec_us_indexed[res.query_idx]
-            refined_dt = refine_timestamp_only(
-                fixed_T_ego_cam=refined_T_ego_cam, # Use the globally refined (or initial) T_ego_cam
-                p2d_inliers=res.p2d_inliers,
-                P3d_inliers=res.P3d_inliers,
-                t_rec_us=t_rec_us,
-                ego_interpolator_us=interpolate_ego_pose_for_opt,
-                K=camera_intrinsics_matrix,
-                dt_bounds_seconds=dt_bounds_ts_only, # Use timestamp-only bounds
-                loss_function=loss_function,
-                verbose=opt_verbose,
-            )
-            if refined_dt is not None:
-                final_delta_t_map[res.query_idx] = refined_dt
-                logging.debug(f" -> Refined dt: {refined_dt:.4f}")
-            else:
-                final_delta_t_map[res.query_idx] = 0.0 # Default dt on failure
-                failed_ts_only_count += 1
-                logging.warning(f" -> Timestamp-only refinement failed for {res.query_name}. Using dt=0.0")
-        
-        if failed_ts_only_count > 0:
-            logging.warning(f"Timestamp-only refinement failed or was skipped for {failed_ts_only_count} out of {len(successful_pnp)} PnP-successful images.")
-
-        # --- 8.4 Add dt=0 for images that failed PnP entirely or were missed ---
+        # --- 3.7 Set dt=0 for PnP-failed images ---
+        # Ensure all images (PnP success or fail) have an entry in final_delta_t_map
         for pnp_res_orig in all_pnp_results:
             if pnp_res_orig.query_idx not in final_delta_t_map:
-                logging.debug(f"Assigning dt=0 to image {pnp_res_orig.query_name} (idx: {pnp_res_orig.query_idx}) as it was not in successful PnP or missed in ts-only refinement.")
+                # This will assign dt=0 to PnP-failed images,
+                # and also to PnP-successful images if joint opt failed or they were excluded.
+                logging.debug(f"Assigning dt=0 to image {pnp_res_orig.query_name} (idx: {pnp_res_orig.query_idx}).")
                 final_delta_t_map[pnp_res_orig.query_idx] = 0.0
-        
-        logging.info(f"Final combined delta_t map contains {len(final_delta_t_map)} entries.")
-        all_dt_values = list(final_delta_t_map.values())
-        if all_dt_values:
-            logging.info(f"Final Delta_t stats (all images): Mean={np.mean(all_dt_values):.4f}s, Std={np.std(all_dt_values):.4f}s, Min={np.min(all_dt_values):.4f}s, Max={np.max(all_dt_values):.4f}s")
 
-        # --- 9. Calculate Final Poses ---
-        logging.info(f"--- 9. Calculating Final Poses using Refined Parameters ---")
-        final_refined_poses_map_cam = {}
-        final_refined_poses_cam_map = {}
-        num_final_poses = 0
+        logging.info(f"Final delta_t map populated for {len(final_delta_t_map)} images (PnP-successful from joint opt, others 0.0).")
+
+        # --- 3.8 Calculate Final Poses ---
+        if refined_T_ego_cam is None: # Should be initial_T_ego_cam_guess if joint opt failed
+             logging.error("`refined_T_ego_cam` is None before final pose calculation, though it should default to initial guess. Critical error. Aborting.")
+             return
+        if not final_delta_t_map and query_idx_to_name : # If we have query images but no dt map (should not happen)
+             logging.error("Final delta_t map is unexpectedly empty. Aborting pose calculation.")
+             return
+
+        logging.info(f"Calculating Final Poses using refined T_ego_cam and delta_t map...")
+        # final_refined_poses_cam_map already initialized
+        num_final_poses = 0; num_calc_errors = 0
         for query_idx, query_name in query_idx_to_name.items():
             if query_idx not in final_delta_t_map:
-                 logging.warning(f"Delta_t missing for index {query_idx} ({query_name}) in final map. Skipping pose calculation.")
-                 continue
+                 logging.warning(f"Delta_t missing for {query_name} in final map. Skipping pose."); num_calc_errors += 1; continue
             if query_idx not in query_timestamps_rec_us_indexed:
-                 logging.warning(f"Recorded timestamp missing for index {query_idx} ({query_name}). Skipping pose calculation.")
-                 continue
-
-            rec_ts_us = query_timestamps_rec_us_indexed[query_idx] # microseconds (int64)
-            delta_t_seconds = final_delta_t_map[query_idx]         # seconds (float)
-
-            # Convert delta_t from seconds to microseconds (as float for precision)
+                 logging.warning(f"Recorded timestamp missing for {query_name}. Skipping pose."); num_calc_errors += 1; continue
+            rec_ts_us = query_timestamps_rec_us_indexed[query_idx]
+            delta_t_seconds = final_delta_t_map[query_idx]
             delta_t_us_float = delta_t_seconds * 1_000_000.0
-
-            # Calculate true timestamp in microseconds.
-            # Ensure float arithmetic for the sum, as query_ts in get_pose_for_timestamp can be float.
             true_ts_us_float = float(rec_ts_us) + delta_t_us_float
-
-            # ego_interpolator_us (via interpolate_ego_pose_for_opt) expects microseconds
-            T_map_ego_final = interpolate_ego_pose_for_opt(true_ts_us_float)
+            T_map_ego_final = interpolate_ego_pose_for_opt_us(true_ts_us_float)
             if T_map_ego_final is None:
-                logging.warning(f"Could not interpolate final ego pose for {query_name} at refined_ts={true_ts_us_float:.3f}. Skipping.")
-                continue
-            
+                logging.warning(f"Could not interpolate final ego pose for {query_name}."); num_calc_errors += 1; continue
             T_map_cam_final = T_map_ego_final @ refined_T_ego_cam
-            final_refined_poses_map_cam[query_name] = T_map_cam_final
-            try:
-                final_refined_poses_cam_map[query_name] = np.linalg.inv(T_map_cam_final)
-            except np.linalg.LinAlgError:
-                logging.warning(f"Could not invert final pose for {query_name}. T_cam_map will be missing.")
+            try: final_refined_poses_cam_map[query_name] = np.linalg.inv(T_map_cam_final)
+            except np.linalg.LinAlgError: logging.warning(f"Could not invert final pose for {query_name}.") # T_cam_map will be missing
             num_final_poses += 1
-        
-        logging.info(f"Calculated {num_final_poses} final refined poses.")
-        if num_final_poses == 0 and len(query_idx_to_name) > 0 : # Error if query images existed but no poses calculated
-            logging.error("No final poses could be calculated. Aborting.")
-            return
+        logging.info(f"Calculated {num_final_poses} final refined poses ({num_calc_errors} errors/skips).")
+        if num_final_poses == 0 and len(query_idx_to_name) > 0 :
+            logging.error("No final poses could be calculated successfully. Check logs.")
 
-        # --- 10. Save Results ---
-        logging.info(f"--- 10. Saving Final Poses to {results_file} ---")
-        if final_refined_poses_cam_map: # Only save if there's something to save
-            save_poses_to_colmap_format(final_refined_poses_cam_map, results_file)
-        else:
-            logging.warning("No refined poses to save.")
+        # --- Step 4: Saving Results ---
+        logging.info("--- Running Step 4: Saving Final Results ---")
+        # (Saving logic remains the same as previous response, uses refined_T_ego_cam, final_delta_t_map, final_refined_poses_cam_map)
+        if refined_T_ego_cam is not None:
+            logging.info(f"Saving refined T_ego_cam to {refined_extrinsics_file}")
+            logging.info(f"Refined T_ego_cam value to be saved:\n{np.round(refined_T_ego_cam, 6)}")
+            try:
+                with open(refined_extrinsics_file, 'w') as f:
+                    f.write("# Refined T_ego_cam (Sensor to Camera Transformation) - Row Major\n")
+                    for row in refined_T_ego_cam: f.write(" ".join(map(str, row)) + "\n")
+                logging.info("Successfully saved refined extrinsics.")
+            except Exception as e: logging.error(f"Failed to save refined extrinsics: {e}", exc_info=True)
+        else: logging.warning("Refined T_ego_cam is None. Cannot save extrinsics.")
 
-        # --- 11. Optional: Final Visualizations ---
+        if final_delta_t_map:
+            logging.info(f"Saving refined delta_t map ({len(final_delta_t_map)} entries) to {refined_delta_t_file}")
+            all_dt_values_final_map = [dt for dt in final_delta_t_map.values()] # Get all values from final map
+            if all_dt_values_final_map: # Check if list is not empty
+                logging.info(f" -> Final Delta_t Stats (ALL images): Mean={np.mean(all_dt_values_final_map):.6f}s, Std={np.std(all_dt_values_final_map):.6f}s, Min={np.min(all_dt_values_final_map):.6f}s, Max={np.max(all_dt_values_final_map):.6f}s")
+            else: logging.info(" -> Final Delta_t map was populated but values list is empty (should not happen if map not empty).")
+            try:
+                with open(refined_delta_t_file, 'w', newline='') as f:
+                    writer = csv.writer(f); writer.writerow(['image_name', 'delta_t_seconds'])
+                    sorted_indices = sorted(final_delta_t_map.keys(), key=lambda idx: query_idx_to_name.get(idx, str(idx)))
+                    for query_idx in sorted_indices:
+                        writer.writerow([query_idx_to_name.get(query_idx, f"idx_{query_idx}"), f"{final_delta_t_map[query_idx]:.9f}"])
+                logging.info("Successfully saved refined delta_t map.")
+            except Exception as e: logging.error(f"Failed to save delta_t map: {e}", exc_info=True)
+        else: logging.warning("Final delta_t map is empty. Cannot save delta_t CSV.")
+
+        logging.info(f"Saving {len(final_refined_poses_cam_map)} final refined poses (T_cam_map) to {refined_poses_file}")
+        if final_refined_poses_cam_map: save_poses_to_colmap_format(final_refined_poses_cam_map, refined_poses_file)
+        else: logging.warning("No refined poses (T_cam_map) to save.")
+
+        # --- Final Visualizations (Optional) ---
         if visualize_steps and final_refined_poses_cam_map:
-            logging.info(f"--- 11. Generating Final Visualizations ({num_images_to_visualize} images) ---")
-            # ... (visualization logic as before, using final_refined_poses_cam_map) ...
+            logging.info(f"Generating Final Map Projection Visualizations ({num_images_to_visualize} images)...")
+            # (Same visualization logic as before)
             vis_count = 0
             sorted_query_names = sorted(final_refined_poses_cam_map.keys())
-
             for query_name in sorted_query_names:
-                if vis_count >= num_images_to_visualize: break
+                 if vis_count >= num_images_to_visualize: break
+                 T_cam_map_final = final_refined_poses_cam_map.get(query_name)
+                 if T_cam_map_final is None: continue # Should not happen if key exists, but safe check
+                 img_path = query_image_dir_undistorted / query_name
+                 if not img_path.exists(): continue
+                 vis_proj_path = vis_pnp_output_dir / f"{Path(query_name).stem}_{camera_name_in_list}_refined.jpg"
+                 try:
+                     visualize_map_projection(str(img_path), processed_lidar_data_loaded, camera_intrinsics_matrix, T_cam_map_final, str(vis_proj_path), None, visualize_map_point_size)
+                     vis_count += 1
+                 except Exception as e_vis: logging.error(f"Error visualizing final projection for {query_name}: {e_vis}", exc_info=True)
+            logging.info(f"Finished generating {vis_count} final visualizations.")
+        elif visualize_steps:
+             logging.warning("Skipping final visualizations because no refined poses were available.")
 
-                T_cam_map_final = final_refined_poses_cam_map.get(query_name)
-                if T_cam_map_final is None: continue
-
-                img_path = query_image_dir_undistorted / query_name
-                if not img_path.exists(): continue
-
-                vis_proj_path = vis_pnp_output_dir / f"{Path(query_name).stem}_{camera_name_in_list}_refined.jpg"
-                logging.debug(f"Generating visualization for {query_name} -> {vis_proj_path}")
-
-                try:
-                    visualize_map_projection(
-                        query_image_path=str(img_path),
-                        processed_lidar_data=processed_lidar_data_loaded,
-                        camera_intrinsics=camera_intrinsics_matrix,
-                        pose_cam_from_map=T_cam_map_final,
-                        output_path=str(vis_proj_path),
-                        dist_coeffs=None, point_size=visualize_map_point_size,
-                        max_vis_points=500000, filter_distance=100.0
-                    )
-                    vis_count += 1
-                except NameError: # Should not happen if visualize_map_projection is defined
-                    logging.error("`visualize_map_projection` function not found. Cannot visualize.")
-                    break
-                except Exception as e_vis:
-                    logging.error(f"Error visualizing {query_name}: {e_vis}", exc_info=True)
-
-    logging.info("Pipeline with staged refinement finished.")
-
+    logging.info("Pipeline execution finished.")
 
 # ==============================================
 # Example Main Block to Run the Pipeline
@@ -3776,11 +3547,10 @@ if __name__ == "__main__":
             pnp_reprojection_error=pnp_reprojection_error, # Maybe tighten this
             pnp_iterations=500,
             pnp_confidence=0.999999,
-            num_top_images_for_joint_opt=20,
+            num_top_images_for_joint_opt=40,
             dt_bounds_joint_opt=(-0.05, 0.05),
-            dt_bounds_ts_only=(-0.1, 0.1),
             loss_function='cauchy',
-            visualize_steps=False,
+            visualize_steps=True,
             num_images_to_visualize=len(RENDER_POSES),
             visualize_map_point_size=visualize_map_point_size,
             opt_verbose=0,

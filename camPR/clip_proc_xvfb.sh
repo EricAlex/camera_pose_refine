@@ -6,7 +6,7 @@ EGO_POSE_FILE="lio_prior_sensor_coord.txt"
 EGO_POSE_CSV="null_0_0_0_local2global_pose.csv"
 CAM_POSE_FILE="null_0_0_0_local2global_cam_pose.csv"
 
-# python3 gwm_init_cam_poses.py -c ${INPUT_DIR}/${CAM_CONFIG_FILE} -p ${INPUT_DIR}/${EGO_POSE_FILE} -e ${INPUT_DIR}/${EGO_POSE_CSV} -o ${INPUT_DIR}/${CAM_POSE_FILE}
+python3 gwm_init_cam_poses.py -c ${INPUT_DIR}/${CAM_CONFIG_FILE} -p ${INPUT_DIR}/${EGO_POSE_FILE} -e ${INPUT_DIR}/${EGO_POSE_CSV} -o ${INPUT_DIR}/${CAM_POSE_FILE}
 
 # List of camera names
 CAM_NAMES=("camera_1" "camera_4" "panoramic_1" "panoramic_2" "panoramic_3" "panoramic_4")
@@ -55,7 +55,7 @@ done
 
 
 
-CAM_NAMES=("panoramic_2")
+# CAM_NAMES=("panoramic_2")
 
 export PYTHONPATH=../
 
