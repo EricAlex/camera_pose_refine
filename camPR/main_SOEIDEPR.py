@@ -28,7 +28,10 @@ from scipy.spatial.distance import cdist
 import json
 import matplotlib.pyplot as plt # For colormap
 import matplotlib.cm as cm
-from scipy.optimize import least_squares
+from scipy.optimize import (
+    least_squares,
+    differential_evolution,
+)
 import functools
 from dataclasses import dataclass
 import argparse
@@ -2429,6 +2432,99 @@ def visualize_2d_points_on_image(
     except Exception as e:
         logging.error(f"Error during {label} visualization for {original_image_path}: {e}", exc_info=True)
 
+# --- Helper: Generate Target Distorted Points ---
+def generate_target_distorted_points(
+    p2d_undistorted_pixels: np.ndarray, # Ideal points in undistorted pixel frame (of K_ideal_fixed)
+    K_sensor_current: np.ndarray,       # Current K_sensor being evaluated/optimized
+    D_sensor_current: np.ndarray,       # Current D_sensor being evaluated/optimized
+    model_type: str,
+    K_ideal_fixed_for_normalization: np.ndarray, # The K corresponding to p2d_undistorted_pixels input
+    img_width: int,
+    img_height: int
+):
+    """
+    Distorts ideal undistorted 2D points (normalized using K_ideal_fixed_for_normalization)
+    to get target points on a sensor image defined by K_sensor_current and D_sensor_current.
+    """
+    if p2d_undistorted_pixels.shape[0] == 0:
+        return np.empty((0, 2), dtype=np.float64)
+
+    p2d_target_dist_pixels_out = np.zeros_like(p2d_undistorted_pixels, dtype=np.float64)
+
+    # 1. Normalize p2d_undistorted_pixels using K_ideal_fixed_for_normalization
+    fx_ideal_norm = K_ideal_fixed_for_normalization[0, 0]
+    fy_ideal_norm = K_ideal_fixed_for_normalization[1, 1]
+    cx_ideal_norm = K_ideal_fixed_for_normalization[0, 2]
+    cy_ideal_norm = K_ideal_fixed_for_normalization[1, 2]
+
+    p2d_normalized_coords = np.zeros_like(p2d_undistorted_pixels, dtype=np.float64)
+    p2d_normalized_coords[:, 0] = (p2d_undistorted_pixels[:, 0] - cx_ideal_norm) / fx_ideal_norm
+    p2d_normalized_coords[:, 1] = (p2d_undistorted_pixels[:, 1] - cy_ideal_norm) / fy_ideal_norm
+    
+    p2d_normalized_reshaped = p2d_normalized_coords.reshape(-1, 1, 2)
+
+    if model_type == "KANNALA_BRANDT":
+        D_sensor_kb_prepared = np.zeros(4, dtype=np.float64)
+        if D_sensor_current is not None:
+            d_flat = D_sensor_current.flatten()
+            D_sensor_kb_prepared[:min(4, len(d_flat))] = d_flat[:min(4, len(d_flat))].astype(np.float64)
+
+        # cv2.fisheye.distortPoints takes NORMALIZED points and outputs DISTORTED PIXEL points
+        # using the K (K_sensor_current) and D (D_sensor_kb_prepared) passed to it.
+        distorted_pixel_pts_cv = cv2.fisheye.distortPoints( # No underscore for the return here
+            p2d_normalized_reshaped,                             # Input: Normalized coordinates
+            np.ascontiguousarray(K_sensor_current, dtype=np.float64), # K of the target distorted camera
+            np.ascontiguousarray(D_sensor_kb_prepared, dtype=np.float64)  # D of the target distorted camera
+        )
+        p2d_target_dist_pixels_out = distorted_pixel_pts_cv.reshape(-1, 2)
+
+    elif model_type == "PINHOLE":
+        # For Pinhole, we project pseudo-3D points (normalized coords with Z=1)
+        # P3D_ideal_cam are effectively (X/Z, Y/Z, 1) where X/Z, Y/Z are p2d_normalized_coords
+        P3D_in_normalized_frame = np.hstack((p2d_normalized_coords, np.ones((p2d_normalized_coords.shape[0], 1)))).astype(np.float32)
+        
+        rvec_ident = np.zeros(3, dtype=np.float32)
+        tvec_ident = np.zeros(3, dtype=np.float32)
+        
+        D_sensor_pinhole_prepared = None
+        if D_sensor_current is not None:
+            D_sensor_pinhole_prepared = D_sensor_current.flatten().astype(np.float64)
+            # Optional: Pad/truncate D_sensor_pinhole_prepared if needed for cv2.projectPoints
+            # e.g., if expecting 5 params for standard pinhole
+            expected_pinhole_d_len = 5
+            if len(D_sensor_pinhole_prepared) < expected_pinhole_d_len:
+                _temp_D = np.zeros(expected_pinhole_d_len, dtype=np.float64)
+                _temp_D[:len(D_sensor_pinhole_prepared)] = D_sensor_pinhole_prepared
+                D_sensor_pinhole_prepared = _temp_D
+            elif len(D_sensor_pinhole_prepared) > expected_pinhole_d_len:
+                 D_sensor_pinhole_prepared = D_sensor_pinhole_prepared[:expected_pinhole_d_len]
+
+
+        distorted_pixel_pts_cv, _ = cv2.projectPoints(
+            P3D_in_normalized_frame, rvec_ident, tvec_ident,
+            np.ascontiguousarray(K_sensor_current, dtype=np.float64), # K of the target distorted camera
+            D_sensor_pinhole_prepared # D of the target distorted camera
+        )
+        p2d_target_dist_pixels_out = distorted_pixel_pts_cv.reshape(-1, 2)
+    else:
+        logging.error(f"Unsupported model_type '{model_type}' in generate_target_distorted_points.")
+        # Fallback: if model is unknown, what should target be? Perhaps undistorted points if K_sensor is similar to K_ideal
+        # Or, more safely, log error and return empty or raise exception. For now, copy normalized.
+        # This part needs careful consideration if other models are genuinely used.
+        # If K_sensor_current is used to "un-normalize" p2d_normalized_coords:
+        fx_s_curr = K_sensor_current[0,0]; fy_s_curr = K_sensor_current[1,1]
+        cx_s_curr = K_sensor_current[0,2]; cy_s_curr = K_sensor_current[1,2]
+        p2d_target_dist_pixels_out[:,0] = p2d_normalized_coords[:,0] * fx_s_curr + cx_s_curr
+        p2d_target_dist_pixels_out[:,1] = p2d_normalized_coords[:,1] * fy_s_curr + cy_s_curr
+
+
+    # --- DEBUG VISUALIZATION CALL within generate_target_distorted_points ---
+    # This needs to be adapted if you want to debug generate_target_distorted_points itself
+    # For now, the debug call is in OptimizationData.__init__ and the main refine_all_parameters_hybrid
+    # It's better to keep the debug viz at higher levels that call this, passing necessary image names etc.
+
+    return p2d_target_dist_pixels_out
+
 class OptimizationData:
     def __init__(self, # Changed from 'init' to '__init__'
                  inlier_matches_map_us: dict,
@@ -2525,7 +2621,7 @@ class OptimizationData:
                 D_sensor_pinhole = None
                 if self.D_initial_sensor is not None: D_sensor_pinhole = self.D_initial_sensor.flatten().astype(np.float64)
                 K_for_project_points = self.K_initial_ideal.astype(np.float64)
-                distorted_pts_cv, _ = cv2.projectPoints( P3D_ideal_cam, rvec_ident, tvec_ident, K_for_project_points, D_sensor_pinhole )
+                distorted_pts_cv = cv2.projectPoints( P3D_ideal_cam, rvec_ident, tvec_ident, K_for_project_points, D_sensor_pinhole )
                 p2d_target_dist_pixels = distorted_pts_cv.reshape(-1, 2)
             else:
                 logging.error(f"Unsupported model_type '{self.model_type}' in OptimizationData.")
@@ -2729,147 +2825,1547 @@ def compute_residuals(X_params_vector, opt_data: OptimizationData): # Renamed X
         residuals[~np.isfinite(residuals)] = 1e6
     return residuals
 
-def compute_residuals_timestamp_only(dt_scalar_seconds, fixed_T_ego_cam, p2d_inliers, P3d_inliers,
-                                     t_rec_us, ego_interpolator_us, K): # Suffixes changed
-    num_matches = p2d_inliers.shape[0]
-    residuals_flat = np.zeros(num_matches * 2, dtype=np.float64) 
+# --- Revised timestamp-only residual and refinement functions ---
+def compute_residuals_timestamp_only_revised_for_de(dt_scalar_seconds, # Input: dt for the current image
+                                     # Fixed parameters for this evaluation:
+                                     fixed_T_ego_cam,
+                                     fixed_K_matrix_sensor, # K of the sensor (potentially being optimized)
+                                     fixed_D_coeffs_sensor, # D of the sensor (potentially being optimized)
+                                     fixed_model_type,
+                                     fixed_img_width, 
+                                     fixed_img_height,
+                                     # Per-image data:
+                                     # p2d_undistorted_ideal_kps, # Undistorted keypoints in K_ideal frame
+                                     p2d_target_distorted_pixels, # TARGET points for current K_sensor, D_sensor
+                                     P3d_world_points,
+                                     t_rec_us,
+                                     ego_interpolator_us
+                                     # K_initial_ideal # K corresponding to p2d_undistorted_ideal_kps
+                                     ):
+    num_matches = P3d_world_points.shape[0]
+    residuals_flat = np.full(num_matches * 2, 1e6, dtype=np.float64) 
+
+    if num_matches == 0:
+        return np.array([], dtype=np.float64)
 
     try:
         dt_value_seconds = dt_scalar_seconds[0] if isinstance(dt_scalar_seconds, np.ndarray) and dt_scalar_seconds.size == 1 else dt_scalar_seconds
-        
-        # --- SCALE dt TO MICROSECONDS ---
-        dt_value_us = dt_value_seconds * 1_000_000.0 # Corrected scaling
-        t_true_i_us = float(t_rec_us) + dt_value_us # Result is in microseconds
+        dt_value_us = dt_value_seconds * 1_000_000.0
+        t_true_i_us = float(t_rec_us) + dt_value_us
 
-        T_map_ego_i = ego_interpolator_us(t_true_i_us) # ego_interpolator_us expects microseconds
-        if T_map_ego_i is None:
-            logging.warning(f"TS_ONLY: Ego pose interpolation failed for t_true_us={t_true_i_us:.0f} (orig t_rec_us={t_rec_us}, dt_s={dt_value_seconds:.4f})")
-            return np.full(num_matches * 2, 1e6, dtype=np.float64)
+        T_map_ego_i = ego_interpolator_us(t_true_i_us)
+        if T_map_ego_i is None: return residuals_flat 
 
         T_map_cam_i = T_map_ego_i @ fixed_T_ego_cam
         try:
             T_cam_map_i = np.linalg.inv(T_map_cam_i)
-        except np.linalg.LinAlgError:
-            logging.warning("TS_ONLY: Pose inversion failed.")
-            return np.full(num_matches * 2, 1e6, dtype=np.float64)
+            R_cam_map_i_for_rodrigues = np.ascontiguousarray(T_cam_map_i[:3, :3])
+            rvec_iter, _ = cv2.Rodrigues(R_cam_map_i_for_rodrigues)
+            rvec_iter = np.ascontiguousarray(rvec_iter)
+            tvec_slice = T_cam_map_i[:3, 3]
+            tvec_iter = np.ascontiguousarray(tvec_slice.reshape(3, 1))
+        except np.linalg.LinAlgError: return residuals_flat
 
-        P3d_h = np.hstack((P3d_inliers, np.ones((num_matches, 1))))
-        P_cam_h = (T_cam_map_i @ P3d_h.T).T
-        valid_depth_mask = P_cam_h[:, 2] > 1e-3 
-
-        p_proj_2d = np.full((num_matches, 2), 1e6) 
-
-        if np.any(valid_depth_mask):
-            P_cam_h_valid = P_cam_h[valid_depth_mask, :3]
-            p_proj_h_valid = (K @ P_cam_h_valid.T).T 
-
-            valid_proj_mask_local = np.abs(p_proj_h_valid[:, 2]) > 1e-6 
-
-            if np.any(valid_proj_mask_local):
-                p_proj_2d_final_valid = np.zeros((np.sum(valid_proj_mask_local), 2))
-                p_proj_2d_final_valid[:, 0] = p_proj_h_valid[valid_proj_mask_local, 0] / p_proj_h_valid[valid_proj_mask_local, 2]
-                p_proj_2d_final_valid[:, 1] = p_proj_h_valid[valid_proj_mask_local, 1] / p_proj_h_valid[valid_proj_mask_local, 2]
-                
-                original_indices_valid_depth = np.where(valid_depth_mask)[0]
-                original_indices_final_valid = original_indices_valid_depth[valid_proj_mask_local]
-                p_proj_2d[original_indices_final_valid] = p_proj_2d_final_valid
+        # --- Projection ---
+        p_proj_distorted_iter_pixels_current_sensor = np.full((num_matches, 2), 1e6, dtype=np.float64)
         
-        r_i = p2d_inliers - p_proj_2d 
+        P3d_h_world = np.hstack((P3d_world_points, np.ones((num_matches, 1))))
+        P_cam_h = (T_cam_map_i @ P3d_h_world.T).T
+        front_of_camera_mask = P_cam_h[:, 2] > 1e-3
+
+        if np.any(front_of_camera_mask):
+            P3d_world_to_project_actual_non_cont = P3d_world_points[front_of_camera_mask]
+            
+            P3d_to_project_cv_input = None
+            if fixed_model_type == "KANNALA_BRANDT":
+                P3d_world_to_project_actual_non_cont_reshaped = P3d_world_to_project_actual_non_cont.reshape(-1,1,3)
+                P3d_to_project_cv_input = np.ascontiguousarray(P3d_world_to_project_actual_non_cont_reshaped)
+            else: # PINHOLE
+                P3d_to_project_cv_input = np.ascontiguousarray(P3d_world_to_project_actual_non_cont)
+
+            projected_points_cv_current_sensor = None
+            if fixed_model_type == "KANNALA_BRANDT":
+                D_fisheye_iter = np.zeros(4, dtype=np.float64)
+                if fixed_D_coeffs_sensor is not None:
+                    d_flat = fixed_D_coeffs_sensor.flatten()
+                    D_fisheye_iter[:min(4, len(d_flat))] = d_flat[:min(4, len(d_flat))]
+                D_fisheye_iter = np.ascontiguousarray(D_fisheye_iter)
+                projected_points_cv_current_sensor, _ = cv2.fisheye.projectPoints(
+                    P3d_to_project_cv_input, rvec_iter, tvec_iter, 
+                    np.ascontiguousarray(fixed_K_matrix_sensor, dtype=np.float64), 
+                    D_fisheye_iter
+                )
+            elif fixed_model_type == "PINHOLE":
+                D_pinhole_iter = np.array([], dtype=np.float64)
+                if fixed_D_coeffs_sensor is not None:
+                    D_pinhole_iter = fixed_D_coeffs_sensor.astype(np.float64).flatten()
+                D_pinhole_iter = np.ascontiguousarray(D_pinhole_iter)
+                projected_points_cv_current_sensor, _ = cv2.projectPoints(
+                    P3d_to_project_cv_input, rvec_iter, tvec_iter, 
+                    np.ascontiguousarray(fixed_K_matrix_sensor, dtype=np.float64), 
+                    D_pinhole_iter
+                )
+            
+            if projected_points_cv_current_sensor is not None:
+                projected_points_flat = projected_points_cv_current_sensor.reshape(-1, 2)
+                p_proj_distorted_iter_pixels_current_sensor[front_of_camera_mask] = projected_points_flat
+        
+        # The target is p2d_target_distorted_pixels, which was generated using K_sensor, D_sensor
+        r_i = p2d_target_distorted_pixels - p_proj_distorted_iter_pixels_current_sensor
         residuals_flat = r_i.flatten()
 
     except Exception as e:
-        logging.error(f"Error in compute_residuals_timestamp_only: {e}\n{traceback.format_exc()}")
         return np.full(num_matches * 2, 1e6, dtype=np.float64)
 
     if not np.all(np.isfinite(residuals_flat)):
-        logging.error("Non-finite values detected in timestamp-only residuals! Replacing with 1e6.")
         residuals_flat[~np.isfinite(residuals_flat)] = 1e6
     return residuals_flat
 
-def refine_timestamp_only(fixed_T_ego_cam, p2d_inliers, P3d_inliers,
-                          t_rec_us, ego_interpolator_us, K,
-                          dt_bounds_seconds=(-0.1, 0.1),
-                          loss_function='cauchy', verbose=0):
-    if p2d_inliers.shape[0] == 0:
-        logging.warning("No inliers provided for timestamp-only refinement.")
-        # Return values consistent with expected tuple: (dt, status, message, optimality)
-        return None, -1, "No inliers", np.inf
+def refine_timestamp_only_revised_for_de(
+    # Fixed parameters for this image's dt optimization (from DE trial)
+    current_T_ego_cam, current_K_matrix_sensor, current_D_coeffs_sensor, current_model_type,
+    current_img_width, current_img_height,
+    # Per-image data
+    p2d_target_distorted_pixels, # Target points for the current K_sensor, D_sensor
+    P3d_world_points,
+    t_rec_us, ego_interpolator_us,
+    # K_initial_ideal_for_undist_input, # K for the undistorted points
+    # Optimization settings
+    dt_bounds_seconds=(-0.02, 0.02), # Tighter bounds for speed
+    loss_function='linear',          # Linear loss for speed in inner loop
+    verbose=0):
+
+    if P3d_world_points.shape[0] == 0:
+        return None, -1, "No inliers", np.inf, 0.0 
 
     x0_dt_seconds = [0.0]
-    bounds_dt_seconds = ([dt_bounds_seconds[0]], [dt_bounds_seconds[1]])
+    # Ensure bounds are correctly formatted as ([low], [high])
+    bounds_dt_seconds_least_sq = ([dt_bounds_seconds[0]], [dt_bounds_seconds[1]])
+
 
     residual_func_partial = functools.partial(
-        compute_residuals_timestamp_only,
-        fixed_T_ego_cam=fixed_T_ego_cam,
-        p2d_inliers=p2d_inliers,
-        P3d_inliers=P3d_inliers,
+        compute_residuals_timestamp_only_revised_for_de, 
+        fixed_T_ego_cam=current_T_ego_cam,
+        fixed_K_matrix_sensor=current_K_matrix_sensor,
+        fixed_D_coeffs_sensor=current_D_coeffs_sensor,
+        fixed_model_type=current_model_type,
+        fixed_img_width=current_img_width,
+        fixed_img_height=current_img_height,
+        p2d_target_distorted_pixels=p2d_target_distorted_pixels,
+        P3d_world_points=P3d_world_points,
         t_rec_us=t_rec_us,
-        ego_interpolator_us=ego_interpolator_us,
-        K=K
+        ego_interpolator_us=ego_interpolator_us
+        # K_initial_ideal=K_initial_ideal_for_undist_input
     )
 
-    dt_val = None
-    status_val = -1 # Default status for pre-optimization
-    message_val = "Optimization not run"
-    optimality_val = np.inf
+    dt_val = None; status_val = -1; message_val = "Optimization not run"
+    optimality_val = np.inf; final_cost_val = np.inf
+
+    initial_residuals = residual_func_partial(x0_dt_seconds)
+    initial_cost = np.inf
+    if initial_residuals is not None and initial_residuals.size > 0:
+        initial_cost = 0.5 * np.sum(initial_residuals**2)
+    
+    if not np.isfinite(initial_cost) or initial_residuals.size == 0 :
+        return 0.0, 0, "Bad initial or no residuals", 0.0, initial_cost
 
     try:
-        # Calculate initial cost if verbose
-        if verbose > 0:
-            initial_residuals_ts_only = residual_func_partial(x0_dt_seconds)
-            if initial_residuals_ts_only is not None and initial_residuals_ts_only.size > 0:
-                 initial_cost_ts_only = 0.5 * np.sum(initial_residuals_ts_only**2)
-                 logging.info(f"TS-Only for t_rec_us={t_rec_us}: Initial cost (dt=0): {initial_cost_ts_only:.4e}")
-            else:
-                 logging.warning(f"TS-Only for t_rec_us={t_rec_us}: Could not compute initial residuals.")
-
-
         result = least_squares(
-            residual_func_partial,
-            x0_dt_seconds,
-            jac='2-point',
-            bounds=bounds_dt_seconds,
-            method='trf',
-            ftol=1e-9, xtol=1e-9, gtol=1e-9, # Slightly tighter tols for 1D
-            loss=loss_function,
-            verbose=verbose, # This is the verbosity for least_squares iterations
-            max_nfev=300 # More NFEV for 1D opt
+            residual_func_partial, x0_dt_seconds, jac='2-point', bounds=bounds_dt_seconds_least_sq,
+            method='trf', ftol=1e-6, xtol=1e-6, gtol=1e-6, # More relaxed for speed
+            loss=loss_function, verbose=0, 
+            max_nfev=50 # Further reduced for speed
         )
-
-        status_val = result.status
-        message_val = result.message
-        optimality_val = result.optimality
-
-        # Calculate final cost if verbose
-        if verbose > 0 :
-            final_residuals_ts_only = residual_func_partial(result.x)
-            if final_residuals_ts_only is not None and final_residuals_ts_only.size > 0 :
-                final_cost_ts_only = 0.5 * np.sum(final_residuals_ts_only**2) # or result.cost
-                logging.info(f"TS-Only for t_rec_us={t_rec_us}: Final cost (dt={result.x[0]:.7f}): {final_cost_ts_only:.4e}. Optimality: {result.optimality:.2e}")
-            else:
-                logging.warning(f"TS-Only for t_rec_us={t_rec_us}: Could not compute final residuals for dt={result.x[0]:.7f}")
-
-
-        if result.success:
+        status_val = result.status; message_val = result.message; optimality_val = result.optimality
+        
+        # Check if cost improved. If not, or if failed, revert to dt=0.0
+        if result.success and result.cost < initial_cost:
             dt_val = result.x[0]
-            # This warning is already good
-            if result.optimality > 1e-2 and verbose > 0:
-                 logging.warning(f"TS-Only opt for t_rec_us={t_rec_us} (dt={dt_val:.7f}s) finished with high optimality: {result.optimality:.2e}")
+            final_cost_val = result.cost
         else:
-            # dt_val remains None
-            logging.warning(f"TS-Only optimization FAILED for t_rec_us={t_rec_us}. Status: {result.status} ('{result.message}'), Optimality: {result.optimality:.2e}. Resulting dt (if any): {result.x[0]:.7f}")
-            if np.isclose(result.x[0], 0.0) and result.status != 0 : # If it failed and result is 0.0
-                 logging.warning(f" -> TS-Only for t_rec_us={t_rec_us} failed and dt is 0.0. Cost may not have improved from initial.")
+            dt_val = 0.0 # Revert if no improvement or failure
+            final_cost_val = initial_cost
+            if verbose > 1 and result.cost >= initial_cost : logging.debug(f"dt_opt for t_rec={t_rec_us}: cost did not improve ({result.cost:.2e} vs {initial_cost:.2e}), dt=0.0")
+            elif verbose > 1 and not result.success : logging.debug(f"dt_opt for t_rec={t_rec_us}: failed, dt=0.0")
 
 
     except Exception as e:
-        logging.error(f"TS-Only optimization CRASHED for t_rec_us={t_rec_us}: {e}\n{traceback.format_exc()}")
-        # dt_val remains None
-        status_val = -100 # Custom status for crash
-        message_val = str(e)
-        optimality_val = np.inf
+        # logging.warning(f"dt_opt CRASHED for t_rec={t_rec_us}: {e}", exc_info=False)
+        dt_val = 0.0 # Revert on crash
+        final_cost_val = initial_cost
+        status_val = -100; message_val = str(e)
 
-    return dt_val, status_val, message_val, optimality_val
+    return dt_val, status_val, message_val, optimality_val, final_cost_val
+
+# --- PnP Derived Initial Guess ---
+def get_pnp_derived_initial_T_ego_cam(
+    successful_pnp_results: list[PnPResult], 
+    query_timestamps_rec_us_indexed: dict, 
+    ego_interpolator_us, 
+    initial_T_ego_cam_guess_fallback: np.ndarray
+):
+    # (Implementation from thought block - kept same)
+    logging.info("Deriving initial T_ego_cam guess from PnP results...")
+    T_ego_cam_estimates_se3 = []
+    for res in successful_pnp_results:
+        if res.initial_T_map_cam is None:
+            logging.debug(f"PnP result for {res.query_name} missing T_map_cam. Skipping for T_ego_cam averaging.")
+            continue
+        
+        t_rec_us = query_timestamps_rec_us_indexed.get(res.query_idx)
+        if t_rec_us is None:
+            logging.warning(f"Missing recorded timestamp for PnP-successful image {res.query_name}. Skipping for T_ego_cam averaging.")
+            continue
+
+        T_map_ego_pnp = ego_interpolator_us(float(t_rec_us)) # dt=0 for this initial guess
+        if T_map_ego_pnp is None:
+            logging.warning(f"Could not interpolate T_map_ego for {res.query_name} (ts={t_rec_us}). Skipping for T_ego_cam averaging.")
+            continue
+        
+        try:
+            T_ego_map_pnp = np.linalg.inv(T_map_ego_pnp)
+            T_ego_cam_estimate_i = T_ego_map_pnp @ res.initial_T_map_cam
+            xi_i = SE3_to_se3(T_ego_cam_estimate_i)
+            T_ego_cam_estimates_se3.append(xi_i)
+        except Exception as e:
+            logging.warning(f"Error processing T_ego_cam for {res.query_name}: {e}. Skipping.")
+            continue
+            
+    if not T_ego_cam_estimates_se3:
+        logging.warning("No valid T_ego_cam estimates from PnP. Using fallback initial guess.")
+        return np.copy(initial_T_ego_cam_guess_fallback) # Return a copy
+
+    xi_ego_cam_avg = np.mean(np.array(T_ego_cam_estimates_se3), axis=0)
+    T_ego_cam_pnp_derived = se3_to_SE3(xi_ego_cam_avg)
+    logging.info(f"Derived PnP-based initial T_ego_cam (from {len(T_ego_cam_estimates_se3)} estimates):\n{np.round(T_ego_cam_pnp_derived, 4)}")
+    
+    if not np.isclose(np.linalg.det(T_ego_cam_pnp_derived[:3,:3]), 1.0):
+        logging.warning("PnP-derived T_ego_cam has non-unit determinant. Using fallback.")
+        return np.copy(initial_T_ego_cam_guess_fallback) # Return a copy
+        
+    return T_ego_cam_pnp_derived
+
+def calculate_robust_cost_for_de(residuals, loss_type='cauchy', scale_c=1.0):
+    """
+    Calculates a robust cost from raw residuals, similar to how scipy.least_squares would.
+    The cost is 0.5 * sum(rho_i), where rho_i is the loss for residual f_i.
+
+    Args:
+        residuals (np.ndarray): Raw residual values (f_i).
+        loss_type (str): Type of robust loss ('linear', 'cauchy', 'huber', etc.).
+        scale_c (float): Scale parameter for the robust loss function (like f_scale in least_squares).
+
+    Returns:
+        float: The calculated robust cost.
+    """
+    if residuals is None or residuals.size == 0:
+        # If there are no residuals (e.g., no points for an image),
+        # the contribution to the total cost should ideally be zero or reflect this.
+        # For an objective function being minimized, a large penalty might be if no points can be processed.
+        # However, if it's just one image out of many, sum of zero is fine.
+        # Let's assume if residuals.size == 0 it means no error from this component.
+        return 0.0 
+
+    if loss_type == 'linear':
+        return 0.5 * np.sum(residuals**2)
+    elif loss_type == 'cauchy':
+        # rho(f_i) = C^2 * log(1 + (f_i/C)^2)
+        # Cost = 0.5 * sum(rho(f_i))
+        scaled_residuals_sq = (residuals / scale_c)**2
+        cost = 0.5 * np.sum(scale_c**2 * np.log1p(scaled_residuals_sq)) # log1p(x) = log(1+x)
+        return cost
+    elif loss_type == 'huber':
+        # rho(f_i) = f_i^2 if |f_i| <= C
+        #          = 2*C*|f_i| - C^2 if |f_i| > C
+        # Cost = 0.5 * sum(rho(f_i))
+        abs_residuals = np.abs(residuals)
+        is_small_res = abs_residuals <= scale_c
+        rho_values = np.zeros_like(residuals)
+        rho_values[is_small_res] = residuals[is_small_res]**2
+        rho_values[~is_small_res] = 2 * scale_c * abs_residuals[~is_small_res] - scale_c**2
+        return 0.5 * np.sum(rho_values)
+    # Add other scipy.optimize.least_squares compatible losses if needed:
+    # 'soft_l1': rho(f_i) = 2 * C * (sqrt(1 + (f_i/C)^2) - 1)
+    # 'arctan': rho(f_i) = C^2 * arctan((f_i/C)^2) -> This is unusual, scipy's is likely different.
+    # Check scipy's exact definitions if expanding further.
+    else:
+        logging.warning(f"Unknown robust loss type '{loss_type}' for DE. Using linear.")
+        return 0.5 * np.sum(residuals**2)
+
+# --- Hybrid Refinement Function ---
+de_eval_count_global = 0 # Keep this global or make it part of objective_data_dict if preferred
+
+def de_objective_func_global(X_de_trial, objective_data_dict):
+    global de_eval_count_global
+    de_eval_count_global += 1
+
+    # Unpack X_de_trial (Global parameters only)
+    xi_ego_cam_trial = X_de_trial[:6]
+    k_params_sensor_trial = X_de_trial[6:6+NUM_K_PARAMS] # NUM_K_PARAMS must be defined
+    num_d_params_from_data = objective_data_dict["num_d_params"]
+    d_params_sensor_trial = X_de_trial[6+NUM_K_PARAMS : 6+NUM_K_PARAMS+num_d_params_from_data]
+
+    # Get DE robust loss settings from objective_data_dict
+    de_robust_loss_type = objective_data_dict.get("de_robust_loss_type", "linear")
+    de_robust_loss_scale = objective_data_dict.get("de_robust_loss_scale", 1.0)
+
+    try:
+        T_ego_cam_trial = se3_to_SE3(xi_ego_cam_trial) # se3_to_SE3 must be defined
+        K_sensor_trial = np.array([[k_params_sensor_trial[0], 0, k_params_sensor_trial[2]],
+                                   [0, k_params_sensor_trial[1], k_params_sensor_trial[3]],
+                                   [0, 0, 1]])
+    except Exception:
+        return np.inf # Invalid transform or K parameters, penalize heavily
+
+    total_robust_cost_for_de_trial = 0.0
+    total_points_contributing = 0
+
+    # Iterate through each image that has PnP inliers
+    for img_idx in objective_data_dict["query_indices_for_opt"]:
+        # p2d_undist_ideal_kps_img are the 2D keypoints on the IDEAL (undistorted) image plane
+        # P3d_world_img are the corresponding 3D world points
+        p2d_undist_ideal_kps_img, P3d_world_img = objective_data_dict["inlier_matches_map_undistorted_ideal"][img_idx]
+
+        if p2d_undist_ideal_kps_img.shape[0] == 0:
+            continue # Skip if no inliers for this image
+
+        t_rec_us_img = objective_data_dict["query_timestamps_rec_us"][img_idx]
+
+        # 1. Generate "target" distorted points on the SENSOR image
+        #    These targets are what the p2d_undist_ideal_kps_img *would look like* if viewed
+        #    by the current K_sensor_trial and D_sensor_trial.
+        p2d_target_distorted_on_sensor = generate_target_distorted_points(
+            p2d_undistorted_pixels=p2d_undist_ideal_kps_img,
+            K_sensor_current=K_sensor_trial,
+            D_sensor_current=d_params_sensor_trial,
+            model_type=objective_data_dict["model_type"],
+            K_ideal_fixed_for_normalization=objective_data_dict["K_initial_ideal_for_undistorted_input"],
+            img_width=objective_data_dict["img_width"],
+            img_height=objective_data_dict["img_height"]
+        )
+
+        if p2d_target_distorted_on_sensor.shape[0] == 0:
+            # If target generation fails (e.g., points behind camera after normalization step inside generate_target)
+            # This indicates an issue with K_sensor_trial or D_sensor_trial for these points
+            penalty_per_point = 1e12
+            if de_robust_loss_type == 'cauchy':
+                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18)
+            total_robust_cost_for_de_trial += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
+            total_points_contributing += p2d_undist_ideal_kps_img.shape[0]
+            continue
+
+        # 2. Compute raw reprojection residuals for this image using dt = 0 seconds
+        #    The `compute_residuals_timestamp_only_revised_for_de` function calculates the
+        #    difference between these `p2d_target_distorted_on_sensor` and the
+        #    3D points reprojected using the trial T_ego_cam, K_sensor, D_sensor, and a given dt.
+        #    Here, we set dt = 0 for the DE evaluation.
+        raw_residuals_for_image = compute_residuals_timestamp_only_revised_for_de(
+            dt_scalar_seconds=0.0, # IMPORTANT: dt is fixed to 0 for DE objective
+            fixed_T_ego_cam=T_ego_cam_trial,
+            fixed_K_matrix_sensor=K_sensor_trial,
+            fixed_D_coeffs_sensor=d_params_sensor_trial,
+            fixed_model_type=objective_data_dict["model_type"],
+            fixed_img_width=objective_data_dict["img_width"],
+            fixed_img_height=objective_data_dict["img_height"],
+            p2d_target_distorted_pixels=p2d_target_distorted_on_sensor, # The targets generated above
+            P3d_world_points=P3d_world_img,
+            t_rec_us=t_rec_us_img,
+            ego_interpolator_us=objective_data_dict["ego_interpolator_us"]
+        )
+
+        # 3. Apply robust loss to the raw residuals
+        if raw_residuals_for_image.size > 0 and np.all(np.isfinite(raw_residuals_for_image)):
+            cost_this_image_robust = calculate_robust_cost_for_de(
+                raw_residuals_for_image,
+                loss_type=de_robust_loss_type,
+                scale_c=de_robust_loss_scale
+            )
+            total_robust_cost_for_de_trial += cost_this_image_robust
+            total_points_contributing += p2d_undist_ideal_kps_img.shape[0]
+        else:
+            # Penalize if residuals are non-finite or empty (unexpected if p2d_undist_ideal_kps_img > 0)
+            penalty_per_point = 1e12
+            if de_robust_loss_type == 'cauchy':
+                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18) # Approx large val for cauchy
+            total_robust_cost_for_de_trial += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
+            total_points_contributing += p2d_undist_ideal_kps_img.shape[0]
+
+    if total_points_contributing == 0: # No points processed across all images
+        return np.inf
+
+    # Average cost per residual component (a point has 2 components: x, y error)
+    avg_robust_cost = total_robust_cost_for_de_trial / (total_points_contributing * 2.0) if total_points_contributing > 0 else np.inf
+
+    # Optional: Logging
+    if de_eval_count_global % (objective_data_dict.get('de_popsize_factor_for_log', 15) * 10) == 0:
+        logging.debug(f"DE Eval {de_eval_count_global}: AvgRobustCost={avg_robust_cost:.4e} (Loss: {de_robust_loss_type}, Scale: {de_robust_loss_scale}) for X_de_trial[0:3]={np.round(X_de_trial[:3],3)}")
+
+    return avg_robust_cost
+
+def de_objective_func_stage1_extrinsics_only(xi_ego_cam_trial, objective_data_dict_stage1):
+    """
+    Objective function for DE Stage 1: Optimize T_ego_cam (extrinsics) only.
+    Intrinsics (K_sensor, D_sensor) are taken as fixed (initial/trusted values).
+    Time offsets (dt) are assumed to be 0.
+    """
+
+    # Fixed K and D for this stage (passed in objective_data_dict_stage1)
+    K_sensor_fixed = objective_data_dict_stage1["K_sensor_fixed"]
+    D_sensor_fixed = objective_data_dict_stage1["D_sensor_fixed"]
+    model_type = objective_data_dict_stage1["model_type"]
+    K_ideal_for_norm = objective_data_dict_stage1["K_initial_ideal_for_undistorted_input"]
+    img_width = objective_data_dict_stage1["img_width"]
+    img_height = objective_data_dict_stage1["img_height"]
+
+    # Robust loss settings
+    de_robust_loss_type = objective_data_dict_stage1.get("de_robust_loss_type", "linear")
+    de_robust_loss_scale = objective_data_dict_stage1.get("de_robust_loss_scale", 1.0)
+
+    try:
+        T_ego_cam_trial = se3_to_SE3(xi_ego_cam_trial) # Extrinsics being optimized
+    except Exception:
+        return np.inf
+
+    total_robust_cost_stage1 = 0.0
+    total_points_contributing_stage1 = 0
+
+    for img_idx in objective_data_dict_stage1["query_indices_for_opt"]:
+        p2d_undist_ideal_kps_img, P3d_world_img = objective_data_dict_stage1["inlier_matches_map_undistorted_ideal"][img_idx]
+        if p2d_undist_ideal_kps_img.shape[0] == 0:
+            continue
+        
+        t_rec_us_img = objective_data_dict_stage1["query_timestamps_rec_us"][img_idx]
+
+        # 1. Generate "target" distorted points using the FIXED K_sensor_fixed, D_sensor_fixed
+        p2d_target_distorted_on_sensor = generate_target_distorted_points(
+            p2d_undistorted_pixels=p2d_undist_ideal_kps_img,
+            K_sensor_current=K_sensor_fixed, # Using fixed K
+            D_sensor_current=D_sensor_fixed, # Using fixed D
+            model_type=model_type,
+            K_ideal_fixed_for_normalization=K_ideal_for_norm,
+            img_width=img_width,
+            img_height=img_height
+        )
+
+        if p2d_target_distorted_on_sensor.shape[0] == 0:
+            penalty_per_point = 1e12 # Penalize if target generation fails
+            if de_robust_loss_type == 'cauchy':
+                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18)
+            total_robust_cost_stage1 += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
+            total_points_contributing_stage1 += p2d_undist_ideal_kps_img.shape[0]
+            continue
+
+        # 2. Compute raw reprojection residuals using TRIAL T_ego_cam_trial,
+        #    FIXED K_sensor_fixed, D_sensor_fixed, and dt = 0.
+        raw_residuals_for_image = compute_residuals_timestamp_only_revised_for_de(
+            dt_scalar_seconds=0.0, # dt = 0 for this stage
+            fixed_T_ego_cam=T_ego_cam_trial, # Trial extrinsics
+            fixed_K_matrix_sensor=K_sensor_fixed, # Fixed K
+            fixed_D_coeffs_sensor=D_sensor_fixed, # Fixed D
+            fixed_model_type=model_type,
+            fixed_img_width=img_width,
+            fixed_img_height=img_height,
+            p2d_target_distorted_pixels=p2d_target_distorted_on_sensor,
+            P3d_world_points=P3d_world_img,
+            t_rec_us=t_rec_us_img,
+            ego_interpolator_us=objective_data_dict_stage1["ego_interpolator_us"]
+        )
+
+        # 3. Apply robust loss
+        if raw_residuals_for_image.size > 0 and np.all(np.isfinite(raw_residuals_for_image)):
+            cost_this_image_robust = calculate_robust_cost_for_de(
+                raw_residuals_for_image,
+                loss_type=de_robust_loss_type,
+                scale_c=de_robust_loss_scale
+            )
+            total_robust_cost_stage1 += cost_this_image_robust
+            total_points_contributing_stage1 += p2d_undist_ideal_kps_img.shape[0]
+        else:
+            penalty_per_point = 1e12
+            if de_robust_loss_type == 'cauchy':
+                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18)
+            total_robust_cost_stage1 += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
+            total_points_contributing_stage1 += p2d_undist_ideal_kps_img.shape[0]
+
+    if total_points_contributing_stage1 == 0:
+        return np.inf
+
+    avg_robust_cost = total_robust_cost_stage1 / (total_points_contributing_stage1 * 2.0) if total_points_contributing_stage1 > 0 else np.inf
+        
+    return avg_robust_cost
+
+def de_objective_func_stage2_intrinsics_only(intrinsics_params_trial, objective_data_dict_stage2):
+    """
+    Objective function for DE Stage 2: Optimize K_sensor, D_sensor (intrinsics) only.
+    T_ego_cam (extrinsics) is taken as fixed (from Stage 1 result).
+    Time offsets (dt) are assumed to be 0.
+    """
+    # intrinsics_params_trial = [k_params_sensor_trial (4), d_params_sensor_trial (N_d)]
+    k_params_sensor_trial = intrinsics_params_trial[:NUM_K_PARAMS]
+    num_d_params_from_data = objective_data_dict_stage2["num_d_params"]
+    d_params_sensor_trial = intrinsics_params_trial[NUM_K_PARAMS : NUM_K_PARAMS + num_d_params_from_data]
+
+    # Fixed T_ego_cam for this stage
+    T_ego_cam_fixed = objective_data_dict_stage2["T_ego_cam_fixed"] # From Stage 1
+    model_type = objective_data_dict_stage2["model_type"]
+    K_ideal_for_norm = objective_data_dict_stage2["K_initial_ideal_for_undistorted_input"]
+    img_width = objective_data_dict_stage2["img_width"]
+    img_height = objective_data_dict_stage2["img_height"]
+
+    # Robust loss settings
+    de_robust_loss_type = objective_data_dict_stage2.get("de_robust_loss_type", "linear")
+    de_robust_loss_scale = objective_data_dict_stage2.get("de_robust_loss_scale", 1.0)
+
+    try:
+        K_sensor_trial = np.array([[k_params_sensor_trial[0], 0, k_params_sensor_trial[2]],
+                                   [0, k_params_sensor_trial[1], k_params_sensor_trial[3]],
+                                   [0, 0, 1]])
+    except Exception:
+        return np.inf # Invalid K parameters
+
+    total_robust_cost_stage2 = 0.0
+    total_points_contributing_stage2 = 0
+
+    for img_idx in objective_data_dict_stage2["query_indices_for_opt"]:
+        p2d_undist_ideal_kps_img, P3d_world_img = objective_data_dict_stage2["inlier_matches_map_undistorted_ideal"][img_idx]
+        if p2d_undist_ideal_kps_img.shape[0] == 0:
+            continue
+        
+        t_rec_us_img = objective_data_dict_stage2["query_timestamps_rec_us"][img_idx]
+
+        # 1. Generate "target" distorted points using the TRIAL K_sensor_trial, D_sensor_trial
+        p2d_target_distorted_on_sensor = generate_target_distorted_points(
+            p2d_undistorted_pixels=p2d_undist_ideal_kps_img,
+            K_sensor_current=K_sensor_trial, # Trial K
+            D_sensor_current=d_params_sensor_trial, # Trial D
+            model_type=model_type,
+            K_ideal_fixed_for_normalization=K_ideal_for_norm,
+            img_width=img_width,
+            img_height=img_height
+        )
+
+        if p2d_target_distorted_on_sensor.shape[0] == 0:
+            penalty_per_point = 1e12
+            if de_robust_loss_type == 'cauchy':
+                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18)
+            total_robust_cost_stage2 += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
+            total_points_contributing_stage2 += p2d_undist_ideal_kps_img.shape[0]
+            continue
+            
+        # 2. Compute raw reprojection residuals using FIXED T_ego_cam_fixed,
+        #    TRIAL K_sensor_trial, D_sensor_trial, and dt = 0.
+        raw_residuals_for_image = compute_residuals_timestamp_only_revised_for_de(
+            dt_scalar_seconds=0.0, # dt = 0 for this stage
+            fixed_T_ego_cam=T_ego_cam_fixed, # Fixed T
+            fixed_K_matrix_sensor=K_sensor_trial, # Trial K
+            fixed_D_coeffs_sensor=d_params_sensor_trial, # Trial D
+            fixed_model_type=model_type,
+            fixed_img_width=img_width,
+            fixed_img_height=img_height,
+            p2d_target_distorted_pixels=p2d_target_distorted_on_sensor,
+            P3d_world_points=P3d_world_img,
+            t_rec_us=t_rec_us_img,
+            ego_interpolator_us=objective_data_dict_stage2["ego_interpolator_us"]
+        )
+
+        # 3. Apply robust loss
+        if raw_residuals_for_image.size > 0 and np.all(np.isfinite(raw_residuals_for_image)):
+            cost_this_image_robust = calculate_robust_cost_for_de(
+                raw_residuals_for_image,
+                loss_type=de_robust_loss_type,
+                scale_c=de_robust_loss_scale
+            )
+            total_robust_cost_stage2 += cost_this_image_robust
+            total_points_contributing_stage2 += p2d_undist_ideal_kps_img.shape[0]
+        else:
+            penalty_per_point = 1e12
+            if de_robust_loss_type == 'cauchy':
+                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18)
+            total_robust_cost_stage2 += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
+            total_points_contributing_stage2 += p2d_undist_ideal_kps_img.shape[0]
+
+
+    if total_points_contributing_stage2 == 0:
+        return np.inf
+
+    avg_robust_cost = total_robust_cost_stage2 / (total_points_contributing_stage2 * 2.0) if total_points_contributing_stage2 > 0 else np.inf
+        
+    return avg_robust_cost
+
+def refine_all_parameters_staged( # New name for the staged approach
+    initial_T_ego_cam_from_config: np.ndarray,
+    pnp_derived_T_ego_cam_guess: np.ndarray, # Can be used to center Stage 1 DE
+    inlier_matches_map_undistorted_ideal: dict,
+    ego_timestamps_us: np.ndarray,
+    ego_poses: list,
+    query_indices_for_opt: list,
+    query_timestamps_rec_us: dict,
+    K_initial_ideal_for_undistorted_input: np.ndarray, # This is K_ideal
+    initial_D_sensor_coeffs: np.ndarray, # This is D_sensor initial
+    model_type: str,
+    img_width: int, img_height: int,
+    # --- Stage 1 DE Extrinsics Parameters ---
+    stage1_de_xi_bounds_abs_offset: np.ndarray = np.array([0.1, 0.1, 0.1, 0.2, 0.2, 0.2]), # Offset for xi bounds
+    stage1_de_popsize_factor: int = 15,
+    stage1_de_maxiter: int = 100, # Might need fewer iterations if only optimizing 6 params
+    # --- Stage 2 DE Intrinsics Parameters ---
+    stage2_de_k_bounds_rel_offset: tuple[float, float] = (0.9, 1.1), # e.g., fx_init * 0.9 to fx_init * 1.1
+    stage2_de_cxcy_bounds_abs_offset_px: float = 30.0, # e.g., cx_init +/- 30px
+    stage2_de_d_bounds_abs_offset: np.ndarray = None, # e.g. np.array([0.03,0.02,0.005,0.005]) for KB k1-k4
+    stage2_de_popsize_factor: int = 15,
+    stage2_de_maxiter: int = 100,
+    # --- Shared DE/LS Parameters ---
+    de_robust_loss_type: str = 'cauchy',
+    de_robust_loss_scale: float = 5.0,
+    de_workers: int = -1,
+    # --- Stage 3 (Final LS) Parameters (similar to original hybrid) ---
+    dt_bounds_seconds_final_ls: tuple[float, float] = (-0.05, 0.05),
+    loss_function_final_ls: str = 'cauchy',
+    final_ls_verbose: int = 1,
+    final_ls_xi_bounds_abs_offset: np.ndarray = np.array([0.03, 0.03, 0.03, 0.08, 0.08, 0.08]),
+    final_ls_k_bounds_rel_offset: tuple[float, float] = (0.98, 1.02),
+    final_ls_cxcy_bounds_abs_offset_px: float = 10.0,
+    final_ls_d_bounds_abs_offset_scale: float = 0.05, # e.g. d_init +/- (0.05*abs(d_init) + 0.008)
+    final_ls_d_bounds_abs_offset_const: float = 0.008,
+    # --- Common params ---
+    interpolation_tolerance_us: int = 1,
+    intrinsic_bounds_config: dict = None, # Can be used to override defaults above
+    debug_opt_data_vis_params: dict = None
+):
+    logging.info("--- Starting STAGED Extrinsics, Intrinsics, and Timestamp Refinement ---")
+    global de_eval_count_global # Reset for accurate counting per run if needed
+    de_eval_count_global = 0
+
+    # --- Initial Parameter Setup (common) ---
+    num_query_images_for_opt = len(query_indices_for_opt)
+    if num_query_images_for_opt == 0: # Should be pre-filtered by caller
+        logging.error("No query images for staged refinement."); return None, None, None, None, None
+
+    num_d_params = 0
+    flat_initial_D_sensor = np.array([])
+    if initial_D_sensor_coeffs is not None:
+        flat_initial_D_sensor = initial_D_sensor_coeffs.flatten()
+        num_d_params = len(flat_initial_D_sensor)
+
+    initial_k_params_ideal = np.array([
+        K_initial_ideal_for_undistorted_input[0, 0], K_initial_ideal_for_undistorted_input[1, 1],
+        K_initial_ideal_for_undistorted_input[0, 2], K_initial_ideal_for_undistorted_input[1, 2]
+    ])
+    
+    ego_interpolator_func = functools.partial(get_pose_for_timestamp,
+                                            timestamps_us=ego_timestamps_us,
+                                            poses=ego_poses,
+                                            tolerance_us=interpolation_tolerance_us)
+
+    # --- STAGE 1: Optimize T_ego_cam (Extrinsics) using DE ---
+    logging.info("\n--- STAGE 1: Optimizing T_ego_cam (Extrinsics) with DE ---")
+    
+    # Determine T_ego_cam to center Stage 1 DE search around
+    T_ego_cam_stage1_center = initial_T_ego_cam_from_config
+    # if pnp_derived_T_ego_cam_guess is not None:
+    #     try:
+    #         if np.isclose(np.linalg.det(pnp_derived_T_ego_cam_guess[:3,:3]), 1.0):
+    #             T_ego_cam_stage1_center = pnp_derived_T_ego_cam_guess
+    #             logging.info("Using PnP-derived T_ego_cam as center for Stage 1 DE search.")
+    #         else:
+    #             logging.warning("PnP-derived T_ego_cam invalid. Using config T_ego_cam for Stage 1 DE center.")
+    #     except: logging.warning("Error with PnP T_ego_cam. Using config T_ego_cam for Stage 1 DE center.")
+    
+    try:
+        xi_ego_cam_stage1_initial_center = SE3_to_se3(T_ego_cam_stage1_center)
+    except:
+        logging.error("Failed to convert T_ego_cam_stage1_center to se3. Using zeros.")
+        xi_ego_cam_stage1_initial_center = np.zeros(6)
+
+    bounds_stage1_xi_low = xi_ego_cam_stage1_initial_center - stage1_de_xi_bounds_abs_offset
+    bounds_stage1_xi_high = xi_ego_cam_stage1_initial_center + stage1_de_xi_bounds_abs_offset
+    de_bounds_stage1 = list(zip(bounds_stage1_xi_low, bounds_stage1_xi_high))
+
+    objective_data_dict_stage1 = {
+        "inlier_matches_map_undistorted_ideal": inlier_matches_map_undistorted_ideal,
+        "query_indices_for_opt": query_indices_for_opt,
+        "query_timestamps_rec_us": query_timestamps_rec_us,
+        "ego_interpolator_us": ego_interpolator_func,
+        "K_initial_ideal_for_undistorted_input": K_initial_ideal_for_undistorted_input,
+        "model_type": model_type, "img_width": img_width, "img_height": img_height,
+        # Fixed intrinsics for Stage 1 (using the initial config/ideal values)
+        "K_sensor_fixed": K_initial_ideal_for_undistorted_input.copy(),
+        "D_sensor_fixed": initial_D_sensor_coeffs.copy() if initial_D_sensor_coeffs is not None else np.array([]),
+        "de_robust_loss_type": de_robust_loss_type,
+        "de_robust_loss_scale": de_robust_loss_scale,
+        "de_popsize_factor_for_log": stage1_de_popsize_factor
+    }
+
+    logging.info(f"Stage 1 DE: Optimizing {len(de_bounds_stage1)} extrinsic parameters.")
+    logging.info(f"Stage 1 DE using fixed K_sensor:\n{objective_data_dict_stage1['K_sensor_fixed']}")
+    logging.info(f"Stage 1 DE using fixed D_sensor: {objective_data_dict_stage1['D_sensor_fixed']}")
+
+    de_result_stage1 = differential_evolution(
+        de_objective_func_stage1_extrinsics_only,
+        bounds=de_bounds_stage1,
+        args=(objective_data_dict_stage1,),
+        strategy='best1bin', maxiter=stage1_de_maxiter, popsize=stage1_de_popsize_factor,
+        tol=0.001, polish=False, disp=True, workers=de_workers, updating='deferred'
+    )
+    
+    if not de_result_stage1.success:
+        logging.warning(f"Stage 1 DE (Extrinsics) did not converge: {de_result_stage1.message}. Using its best found parameters.")
+    xi_ego_cam_from_stage1 = de_result_stage1.x
+    T_ego_cam_from_stage1 = se3_to_SE3(xi_ego_cam_from_stage1)
+    logging.info(f"Stage 1 DE (Extrinsics) finished. Cost: {de_result_stage1.fun:.6e}")
+    logging.info(f"T_ego_cam from Stage 1:\n{np.round(T_ego_cam_from_stage1, 5)}")
+
+    # --- STAGE 2: Optimize K_sensor, D_sensor (Intrinsics) using DE, with T_ego_cam fixed ---
+    logging.info("\n--- STAGE 2: Optimizing K_sensor, D_sensor (Intrinsics) with DE (fixed T_ego_cam) ---")
+    
+    # Bounds for K (relative to initial K_ideal)
+    k_s2_low = initial_k_params_ideal * stage2_de_k_bounds_rel_offset[0]
+    k_s2_high = initial_k_params_ideal * stage2_de_k_bounds_rel_offset[1]
+    # Bounds for cx, cy (absolute offset from initial K_ideal)
+    k_s2_low[2] = initial_k_params_ideal[2] - stage2_de_cxcy_bounds_abs_offset_px
+    k_s2_high[2] = initial_k_params_ideal[2] + stage2_de_cxcy_bounds_abs_offset_px
+    k_s2_low[3] = initial_k_params_ideal[3] - stage2_de_cxcy_bounds_abs_offset_px
+    k_s2_high[3] = initial_k_params_ideal[3] + stage2_de_cxcy_bounds_abs_offset_px
+    # Ensure cx,cy bounds are valid
+    k_s2_low[2] = max(0, k_s2_low[2]); k_s2_high[2] = min(img_width -1, k_s2_high[2])
+    k_s2_low[3] = max(0, k_s2_low[3]); k_s2_high[3] = min(img_height -1, k_s2_high[3])
+
+    # Bounds for D (absolute offset from initial D_sensor)
+    d_s2_low, d_s2_high = np.array([]), np.array([])
+    if num_d_params > 0:
+        d_offset = stage2_de_d_bounds_abs_offset
+        if d_offset is None: # Default if not provided
+            if model_type == "KANNALA_BRANDT": d_offset = np.array([0.05, 0.03, 0.01, 0.01])
+            elif model_type == "PINHOLE" and num_d_params >=4 : d_offset = np.array([0.1, 0.05, 0.005, 0.005]) # for k1,k2,p1,p2
+            else: d_offset = np.full(num_d_params, 0.02)
+        
+        # Ensure d_offset has correct length for flat_initial_D_sensor
+        d_offset_corrected = np.resize(d_offset, flat_initial_D_sensor.shape)
+
+        d_s2_low = flat_initial_D_sensor - d_offset_corrected
+        d_s2_high = flat_initial_D_sensor + d_offset_corrected
+
+    de_bounds_stage2_list = list(zip(np.concatenate((k_s2_low, d_s2_low)),
+                                     np.concatenate((k_s2_high, d_s2_high))))
+
+    objective_data_dict_stage2 = {
+        "inlier_matches_map_undistorted_ideal": inlier_matches_map_undistorted_ideal,
+        "query_indices_for_opt": query_indices_for_opt,
+        "query_timestamps_rec_us": query_timestamps_rec_us,
+        "ego_interpolator_us": ego_interpolator_func,
+        "K_initial_ideal_for_undistorted_input": K_initial_ideal_for_undistorted_input,
+        "model_type": model_type, "img_width": img_width, "img_height": img_height,
+        "num_d_params": num_d_params,
+        "T_ego_cam_fixed": T_ego_cam_from_stage1.copy(), # Use result from Stage 1
+        "de_robust_loss_type": de_robust_loss_type,
+        "de_robust_loss_scale": de_robust_loss_scale,
+        "de_popsize_factor_for_log": stage2_de_popsize_factor
+    }
+    
+    logging.info(f"Stage 2 DE: Optimizing {len(de_bounds_stage2_list)} intrinsic parameters.")
+    logging.info(f"Stage 2 DE using fixed T_ego_cam:\n{objective_data_dict_stage2['T_ego_cam_fixed']}")
+
+    de_result_stage2 = differential_evolution(
+        de_objective_func_stage2_intrinsics_only,
+        bounds=de_bounds_stage2_list,
+        args=(objective_data_dict_stage2,),
+        strategy='best1bin', maxiter=stage2_de_maxiter, popsize=stage2_de_popsize_factor,
+        tol=0.001, polish=False, disp=True, workers=de_workers, updating='deferred'
+    )
+
+    if not de_result_stage2.success:
+        logging.warning(f"Stage 2 DE (Intrinsics) did not converge: {de_result_stage2.message}. Using its best found parameters.")
+    
+    intrinsics_params_from_stage2 = de_result_stage2.x
+    k_params_from_stage2 = intrinsics_params_from_stage2[:NUM_K_PARAMS]
+    d_params_from_stage2 = intrinsics_params_from_stage2[NUM_K_PARAMS : NUM_K_PARAMS + num_d_params]
+    
+    K_sensor_from_stage2 = np.array([[k_params_from_stage2[0], 0, k_params_from_stage2[2]],
+                                     [0, k_params_from_stage2[1], k_params_from_stage2[3]],
+                                     [0, 0, 1]])
+    D_sensor_from_stage2 = d_params_from_stage2 # Already flat
+
+    logging.info(f"Stage 2 DE (Intrinsics) finished. Cost: {de_result_stage2.fun:.6e}")
+    logging.info(f"K_sensor from Stage 2:\n{np.round(K_sensor_from_stage2, 4)}")
+    logging.info(f"D_sensor from Stage 2: {np.round(D_sensor_from_stage2, 6)}")
+
+
+    # --- STAGE 3: Final Joint Refinement (LS of T_ego_cam, K, D, and all dt_i) ---
+    # This part is largely similar to the final LS in the original refine_all_parameters_hybrid
+    # but initialized with results from Stage 1 (T_ego_cam) and Stage 2 (K, D).
+    # The dt values will be initialized to 0 or re-calculated based on Stage 1 & 2 results.
+    logging.info("\n--- STAGE 3: Final Joint Refinement (T_ego_cam, K, D, dt_i) with Least Squares ---")
+
+    # Initialize dt_i based on T_ego_cam_from_stage1 and K/D_from_stage2
+    logging.info("Calculating optimal dt_i values based on Stage 1 & 2 results for final LS initialization...")
+    dt_init_for_final_ls_map = {}
+    for img_idx in query_indices_for_opt:
+        p2d_undist_ideal_kps_img, P3d_world_img = inlier_matches_map_undistorted_ideal[img_idx]
+        if p2d_undist_ideal_kps_img.shape[0] == 0:
+            dt_init_for_final_ls_map[img_idx] = 0.0; continue
+        t_rec_us_img = query_timestamps_rec_us[img_idx]
+        p2d_target_dist_final_ls_init = generate_target_distorted_points(
+            p2d_undist_ideal_kps_img, K_sensor_from_stage2, D_sensor_from_stage2,
+            model_type, K_initial_ideal_for_undistorted_input, img_width, img_height
+        )
+        if p2d_target_dist_final_ls_init.shape[0] == 0:
+            dt_init_for_final_ls_map[img_idx] = 0.0; continue
+
+        # Inner LS for dt uses 'linear' loss
+        dt_opt_s, _, _, _, _ = refine_timestamp_only_revised_for_de(
+            T_ego_cam_from_stage1, K_sensor_from_stage2, D_sensor_from_stage2, model_type,
+            img_width, img_height,
+            p2d_target_dist_final_ls_init, P3d_world_img, t_rec_us_img,
+            ego_interpolator_func,
+            dt_bounds_seconds=dt_bounds_seconds_final_ls, # Use final LS dt bounds here
+            loss_function='linear' 
+        )
+        dt_init_for_final_ls_map[img_idx] = dt_opt_s if dt_opt_s is not None else 0.0
+    
+    # Create OptimizationData for the final LS step
+    # It uses K_sensor_from_stage2 and D_sensor_from_stage2 as its "initial" K and D
+    # for generating its internal p2d_target_distorted points.
+    try:
+        opt_data_final_ls = OptimizationData(
+            inlier_matches_map_us=inlier_matches_map_undistorted_ideal,
+            ego_interpolator_us=ego_interpolator_func,
+            K_initial_ideal=K_sensor_from_stage2, # Initial K for OptData is from Stage 2
+            D_initial_sensor=D_sensor_from_stage2, # Initial D for OptData is from Stage 2
+            model_type=model_type,
+            img_width=img_width, img_height=img_height,
+            t_rec_map_us=query_timestamps_rec_us,
+            num_images_passed_to_constructor=len(query_indices_for_opt),
+            debug_image_idx_to_name_map=debug_opt_data_vis_params.get('image_idx_to_name_map') if debug_opt_data_vis_params else None,
+            debug_query_image_dir=debug_opt_data_vis_params.get('query_image_dir') if debug_opt_data_vis_params else None,
+            debug_output_vis_dir=debug_opt_data_vis_params.get('output_vis_dir') if debug_opt_data_vis_params else None,
+            debug_vis_image_indices=debug_opt_data_vis_params.get('vis_image_indices') if debug_opt_data_vis_params else []
+        )
+    except Exception as e_optdata:
+        logging.error(f"Failed to create OptimizationData for Stage 3 LS: {e_optdata}", exc_info=True)
+        return T_ego_cam_from_stage1, K_sensor_from_stage2, D_sensor_from_stage2, dt_init_for_final_ls_map, None # Return Stage 1&2 results
+
+    if opt_data_final_ls.num_opt_images == 0:
+        logging.error("OptData for Stage 3 LS has zero images. Returning Stage 1 & 2 results.")
+        return T_ego_cam_from_stage1, K_sensor_from_stage2, D_sensor_from_stage2, dt_init_for_final_ls_map, None
+
+    # Initial guess for final LS
+    xi_ego_cam_ls_init = xi_ego_cam_from_stage1 # From Stage 1
+    k_params_ls_init = k_params_from_stage2   # From Stage 2
+    d_params_ls_init = D_sensor_from_stage2   # From Stage 2 (already flat)
+    
+    dt_ls_init_seconds_vec = np.zeros(opt_data_final_ls.num_opt_images)
+    for i, img_idx_in_opt_data in enumerate(opt_data_final_ls.image_indices):
+        dt_ls_init_seconds_vec[i] = dt_init_for_final_ls_map.get(img_idx_in_opt_data, 0.0)
+    
+    x0_final_ls = np.concatenate((xi_ego_cam_ls_init, k_params_ls_init, d_params_ls_init, dt_ls_init_seconds_vec))
+
+    # Bounds for final LS (tighter, around Stage 1/2 results)
+    bounds_ls_low = list(xi_ego_cam_ls_init - final_ls_xi_bounds_abs_offset)
+    bounds_ls_high = list(xi_ego_cam_ls_init + final_ls_xi_bounds_abs_offset)
+
+    k_ls_b_low = k_params_ls_init * final_ls_k_bounds_rel_offset[0]
+    k_ls_b_high = k_params_ls_init * final_ls_k_bounds_rel_offset[1]
+    k_ls_b_low[2] = k_params_ls_init[2] - final_ls_cxcy_bounds_abs_offset_px
+    k_ls_b_high[2] = k_params_ls_init[2] + final_ls_cxcy_bounds_abs_offset_px
+    k_ls_b_low[3] = k_params_ls_init[3] - final_ls_cxcy_bounds_abs_offset_px
+    k_ls_b_high[3] = k_params_ls_init[3] + final_ls_cxcy_bounds_abs_offset_px
+    k_ls_b_low[2] = max(0,k_ls_b_low[2]); k_ls_b_high[2] = min(img_width-1,k_ls_b_high[2])
+    k_ls_b_low[3] = max(0,k_ls_b_low[3]); k_ls_b_high[3] = min(img_height-1,k_ls_b_high[3])
+    bounds_ls_low.extend(k_ls_b_low)
+    bounds_ls_high.extend(k_ls_b_high)
+
+    if num_d_params > 0:
+        d_abs = np.abs(d_params_ls_init)
+        d_ls_b_low = list(d_params_ls_init - final_ls_d_bounds_abs_offset_scale * d_abs - final_ls_d_bounds_abs_offset_const)
+        d_ls_b_high = list(d_params_ls_init + final_ls_d_bounds_abs_offset_scale * d_abs + final_ls_d_bounds_abs_offset_const)
+        for i_d in range(len(d_ls_b_low)):
+            if d_ls_b_low[i_d] >= d_ls_b_high[i_d]:
+                d_mid = (d_ls_b_low[i_d] + d_ls_b_high[i_d])/2.0
+                d_ls_b_low[i_d] = d_mid - 1e-4; d_ls_b_high[i_d] = d_mid + 1e-4
+        bounds_ls_low.extend(d_ls_b_low)
+        bounds_ls_high.extend(d_ls_b_high)
+    
+    bounds_ls_low.extend([dt_bounds_seconds_final_ls[0]] * opt_data_final_ls.num_opt_images)
+    bounds_ls_high.extend([dt_bounds_seconds_final_ls[1]] * opt_data_final_ls.num_opt_images)
+    bounds_final_ls_staged = (bounds_ls_low, bounds_ls_high)
+
+    # f_scale for robust loss in final LS
+    f_scale_final_ls = de_robust_loss_scale # Use the same scale as DE stages, or make it a new param
+
+    try:
+        initial_final_ls_residuals = compute_residuals(x0_final_ls, opt_data_final_ls)
+        initial_final_ls_cost_robust = calculate_robust_cost_for_de(
+            initial_final_ls_residuals, loss_function_final_ls, f_scale_final_ls
+        )
+        logging.info(f"Stage 3 LS: Initial cost (from Stage 1&2, robust '{loss_function_final_ls}' eval, scale={f_scale_final_ls}): {initial_final_ls_cost_robust:.4e}")
+    except Exception as e_ls_init_cost:
+        logging.error(f"Failed to compute initial cost for Stage 3 LS: {e_ls_init_cost}. Returning Stage 1&2 results.", exc_info=True)
+        return T_ego_cam_from_stage1, K_sensor_from_stage2, D_sensor_from_stage2, dt_init_for_final_ls_map, None
+
+    final_ls_result_obj = None
+    try:
+        final_ls_result_obj = least_squares(
+            compute_residuals, x0_final_ls, jac='2-point', bounds=bounds_final_ls_staged, method='trf',
+            ftol=1e-9, xtol=1e-9, gtol=1e-9, # Strict tolerances for final stage
+            loss=loss_function_final_ls, f_scale=f_scale_final_ls,
+            verbose=final_ls_verbose,
+            max_nfev=2500 * len(x0_final_ls), # Allow more evaluations for final tuning
+            args=(opt_data_final_ls,)
+        )
+        logging.info(f"Stage 3 LS optimization finished. Status: {final_ls_result_obj.status} ({final_ls_result_obj.message})")
+        logging.info(f"Stage 3 LS cost (using '{loss_function_final_ls}' with f_scale={f_scale_final_ls}): {final_ls_result_obj.cost:.4e}. Optimality: {final_ls_result_obj.optimality:.4e}")
+    except Exception as e_ls_final:
+        logging.error(f"Stage 3 LS optimization crashed: {e_ls_final}. Returning Stage 1&2 results.", exc_info=True)
+        return T_ego_cam_from_stage1, K_sensor_from_stage2, D_sensor_from_stage2, dt_init_for_final_ls_map, None
+
+    # --- Unpack Final Results from Stage 3 LS ---
+    # Default to Stage 1/2 results if LS fails or doesn't improve
+    T_ego_cam_final_staged = T_ego_cam_from_stage1
+    K_sensor_final_staged = K_sensor_from_stage2
+    D_sensor_final_staged = D_sensor_from_stage2
+    final_refined_delta_t_map_seconds_staged = dt_init_for_final_ls_map
+
+    if final_ls_result_obj and (final_ls_result_obj.success or final_ls_result_obj.cost < initial_final_ls_cost_robust):
+        X_ls_final = final_ls_result_obj.x
+        T_ego_cam_final_staged = se3_to_SE3(X_ls_final[:6])
+        k_final_params = X_ls_final[6:6+NUM_K_PARAMS]
+        K_sensor_final_staged = np.array([[k_final_params[0], 0, k_final_params[2]],
+                                          [0, k_final_params[1], k_final_params[3]],
+                                          [0,0,1]])
+        D_sensor_final_staged = X_ls_final[6+NUM_K_PARAMS : 6+NUM_K_PARAMS+num_d_params]
+        
+        dt_final_seconds_flat = X_ls_final[6+NUM_K_PARAMS+num_d_params:]
+        # final_refined_delta_t_map_seconds_staged already initialized, update it
+        for i, img_idx_in_opt_data in enumerate(opt_data_final_ls.image_indices):
+            if img_idx_in_opt_data in final_refined_delta_t_map_seconds_staged:
+                 final_refined_delta_t_map_seconds_staged[img_idx_in_opt_data] = dt_final_seconds_flat[i]
+        logging.info("Successfully refined all parameters using 3-Stage optimization (DE-Extr -> DE-Intr -> LS-Joint).")
+    else:
+        logging.warning("Stage 3 LS did not improve upon Stage 1&2 results or failed. Returning Stage 1&2 parameters with LS-initialized dt.")
+
+    # Log final parameters
+    logging.info(f"Final Refined T_ego_cam (Staged):\n{np.round(T_ego_cam_final_staged, 6)}")
+    logging.info(f"Final Refined K_sensor (Staged):\n{np.round(K_sensor_final_staged, 4)}")
+    if num_d_params > 0:
+        logging.info(f"Final Refined D_sensor (Staged):\n{np.round(D_sensor_final_staged, 7)}")
+
+    return T_ego_cam_final_staged, K_sensor_final_staged, D_sensor_final_staged, final_refined_delta_t_map_seconds_staged, final_ls_result_obj
+
+def refine_parameters_de_extr_then_ls_joint(
+    # --- Inputs for Initial State & Data ---
+    initial_T_ego_cam_from_config: np.ndarray,
+    pnp_derived_T_ego_cam_guess: np.ndarray,
+    inlier_matches_map_undistorted_ideal: dict,
+    ego_timestamps_us: np.ndarray,
+    ego_poses: list,
+    query_indices_for_opt: list,
+    query_timestamps_rec_us: dict,
+    K_initial_sensor: np.ndarray,   # Initial K_sensor (e.g., from config)
+    initial_D_sensor_coeffs: np.ndarray, # Initial D_sensor (e.g., from config)
+    model_type: str,
+    img_width: int, img_height: int,
+    K_ideal_for_undistorted_input_normalization: np.ndarray,
+
+    # --- Stage 1 DE (Extrinsics) Parameters ---
+    # Wider bounds for DE exploration of extrinsics
+    stage1_de_xi_bounds_abs_offset: np.ndarray = np.array([0.2, 0.2, 0.2, 0.4, 0.4, 0.4]), # Made wider
+    stage1_de_popsize_factor: int = 15,
+    stage1_de_maxiter: int = 100,
+    
+    # --- Shared DE Parameters ---
+    de_robust_loss_type: str = 'cauchy',
+    de_robust_loss_scale: float = 5.0,
+    de_workers: int = -1,
+    
+    # --- Stage 2 (Final Joint LS) Parameters ---
+    final_ls_dt_bounds_seconds: tuple[float, float] = (-0.05, 0.05),
+    final_ls_loss_function: str = 'cauchy',
+    final_ls_verbose: int = 1,
+    # `final_ls_xi_bounds_abs_offset` will be same as `stage1_de_xi_bounds_abs_offset`
+    # `final_ls_intrinsic_bounds_from_config` will be the cfg_intrinsic_bounds from main
+    final_ls_intrinsic_bounds_from_config: dict = None, # To pass cfg_intrinsic_bounds
+
+    # --- Common params ---
+    interpolation_tolerance_us: int = 1,
+    debug_opt_data_vis_params: dict = None
+):
+    logging.info("--- Starting 2-STAGE Refinement (V2): DE (Extr) -> LS (Joint, Intrinsics bounded by config) ---")
+    global de_eval_count_global
+    de_eval_count_global = 0
+
+    # --- Initial Parameter Setup (common) ---
+    # (This part remains the same: num_d_params, ego_interpolator_func)
+    if not query_indices_for_opt:
+        logging.error("No query images for staged refinement."); return None, None, None, None, None
+
+    num_d_params = 0
+    flat_initial_D_sensor_coeffs = np.array([])
+    if initial_D_sensor_coeffs is not None:
+        flat_initial_D_sensor_coeffs = initial_D_sensor_coeffs.flatten()
+        num_d_params = len(flat_initial_D_sensor_coeffs)
+    
+    ego_interpolator_func = functools.partial(get_pose_for_timestamp,
+                                            timestamps_us=ego_timestamps_us,
+                                            poses=ego_poses,
+                                            tolerance_us=interpolation_tolerance_us)
+
+    # --- STAGE 1: Optimize T_ego_cam (Extrinsics) using DE ---
+    # (This stage remains the same as in the previous response)
+    # It uses `stage1_de_xi_bounds_abs_offset`
+    logging.info("\n--- STAGE 1: Optimizing T_ego_cam (Extrinsics) with DE ---")
+    logging.info(f"Stage 1 DE will use FIXED K_sensor:\n{K_initial_sensor}")
+    logging.info(f"Stage 1 DE will use FIXED D_sensor: {initial_D_sensor_coeffs}")
+
+    T_ego_cam_stage1_center = initial_T_ego_cam_from_config
+    # if pnp_derived_T_ego_cam_guess is not None:
+    #     try:
+    #         if np.isclose(np.linalg.det(pnp_derived_T_ego_cam_guess[:3,:3]), 1.0):
+    #             T_ego_cam_stage1_center = pnp_derived_T_ego_cam_guess
+    #             logging.info("Using PnP-derived T_ego_cam as center for Stage 1 DE search.")
+    #     except: pass
+    
+    try:
+        xi_ego_cam_stage1_initial_center = SE3_to_se3(T_ego_cam_stage1_center)
+    except:
+        logging.error("Failed to convert T_ego_cam_stage1_center to se3 for DE. Using zeros.")
+        xi_ego_cam_stage1_initial_center = np.zeros(6)
+
+    bounds_stage1_xi_low = xi_ego_cam_stage1_initial_center - stage1_de_xi_bounds_abs_offset
+    bounds_stage1_xi_high = xi_ego_cam_stage1_initial_center + stage1_de_xi_bounds_abs_offset
+    de_bounds_stage1 = list(zip(bounds_stage1_xi_low, bounds_stage1_xi_high))
+
+    objective_data_dict_stage1 = {
+        "inlier_matches_map_undistorted_ideal": inlier_matches_map_undistorted_ideal,
+        "query_indices_for_opt": query_indices_for_opt,
+        "query_timestamps_rec_us": query_timestamps_rec_us,
+        "ego_interpolator_us": ego_interpolator_func,
+        "K_initial_ideal_for_undistorted_input": K_ideal_for_undistorted_input_normalization,
+        "model_type": model_type, "img_width": img_width, "img_height": img_height,
+        "K_sensor_fixed": K_initial_sensor.copy(),
+        "D_sensor_fixed": initial_D_sensor_coeffs.copy() if initial_D_sensor_coeffs is not None else np.array([]),
+        "de_robust_loss_type": de_robust_loss_type,
+        "de_robust_loss_scale": de_robust_loss_scale,
+        "de_popsize_factor_for_log": stage1_de_popsize_factor
+    }
+
+    de_result_stage1 = differential_evolution(
+        de_objective_func_stage1_extrinsics_only,
+        bounds=de_bounds_stage1,
+        args=(objective_data_dict_stage1,),
+        strategy='best1bin', maxiter=stage1_de_maxiter, popsize=stage1_de_popsize_factor,
+        tol=0.001, polish=False, disp=True, workers=de_workers, updating='deferred'
+    )
+    
+    if not de_result_stage1.success and de_result_stage1.fun > 1e5:
+        logging.error(f"Stage 1 DE (Extrinsics) failed badly (cost: {de_result_stage1.fun:.2e}). Aborting.")
+        dt_map_fallback = {idx: 0.0 for idx in query_indices_for_opt}
+        return initial_T_ego_cam_from_config, K_initial_sensor, initial_D_sensor_coeffs, dt_map_fallback, de_result_stage1
+
+    xi_ego_cam_from_stage1 = de_result_stage1.x
+    T_ego_cam_from_stage1 = se3_to_SE3(xi_ego_cam_from_stage1)
+    logging.info(f"Stage 1 DE (Extrinsics) finished. Cost: {de_result_stage1.fun:.6e}")
+    logging.info(f"T_ego_cam from Stage 1 DE:\n{np.round(T_ego_cam_from_stage1, 5)}")
+
+
+    # --- STAGE 2: Final Joint Refinement (LS of T_ego_cam, K_sensor, D_sensor, and all dt_i) ---
+    logging.info("\n--- STAGE 2: Final Joint Refinement (T_ego_cam, K, D, dt_i) with Least Squares ---")
+
+    # K_sensor and D_sensor for LS are initialized from the *original input values*.
+    K_sensor_ls_init = K_initial_sensor.copy()
+    D_sensor_ls_init_flat = flat_initial_D_sensor_coeffs.copy()
+
+    # dt_i initialization (same as before)
+    logging.info("Calculating initial dt_i values for Stage 2 LS (using Stage 1 T_ego_cam and initial K/D)...")
+    dt_init_for_final_ls_map = {}
+    # (dt calculation loop is the same, using T_ego_cam_from_stage1, K_sensor_ls_init, D_sensor_ls_init_flat)
+    for img_idx in query_indices_for_opt:
+        p2d_undist_ideal_kps_img, P3d_world_img = inlier_matches_map_undistorted_ideal[img_idx]
+        if p2d_undist_ideal_kps_img.shape[0] == 0:
+            dt_init_for_final_ls_map[img_idx] = 0.0; continue
+        t_rec_us_img = query_timestamps_rec_us[img_idx]
+        p2d_target_dist_final_ls_init = generate_target_distorted_points(
+            p2d_undist_ideal_kps_img, K_sensor_ls_init, D_sensor_ls_init_flat, model_type,
+            K_ideal_for_undistorted_input_normalization, img_width, img_height
+        )
+        if p2d_target_dist_final_ls_init.shape[0] == 0:
+            dt_init_for_final_ls_map[img_idx] = 0.0; continue
+        dt_opt_s, _, _, _, _ = refine_timestamp_only_revised_for_de(
+            T_ego_cam_from_stage1, K_sensor_ls_init, D_sensor_ls_init_flat, model_type, img_width, img_height,
+            p2d_target_dist_final_ls_init, P3d_world_img, t_rec_us_img, ego_interpolator_func,
+            dt_bounds_seconds=final_ls_dt_bounds_seconds, loss_function='linear'
+        )
+        dt_init_for_final_ls_map[img_idx] = dt_opt_s if dt_opt_s is not None else 0.0
+
+    # OptData for final LS (initial K/D for OptData are the K_sensor_ls_init / D_sensor_ls_init_flat)
+    # (OptData creation is the same)
+    try:
+        opt_data_final_ls = OptimizationData(
+            inlier_matches_map_us=inlier_matches_map_undistorted_ideal,
+            ego_interpolator_us=ego_interpolator_func,
+            K_initial_ideal=K_sensor_ls_init,
+            D_initial_sensor=D_sensor_ls_init_flat,
+            model_type=model_type,
+            img_width=img_width, img_height=img_height,
+            t_rec_map_us=query_timestamps_rec_us,
+            num_images_passed_to_constructor=len(query_indices_for_opt),
+            debug_image_idx_to_name_map=debug_opt_data_vis_params.get('image_idx_to_name_map') if debug_opt_data_vis_params else None,
+            debug_query_image_dir=debug_opt_data_vis_params.get('query_image_dir') if debug_opt_data_vis_params else None,
+            debug_output_vis_dir=debug_opt_data_vis_params.get('output_vis_dir') if debug_opt_data_vis_params else None,
+            debug_vis_image_indices=debug_opt_data_vis_params.get('vis_image_indices') if debug_opt_data_vis_params else []
+        )
+    except Exception as e_optdata:
+        logging.error(f"Failed to create OptimizationData for Stage 2 LS: {e_optdata}", exc_info=True)
+        return T_ego_cam_from_stage1, K_initial_sensor, initial_D_sensor_coeffs, dt_init_for_final_ls_map, None
+
+    if opt_data_final_ls.num_opt_images == 0:
+        logging.error("OptData for Stage 2 LS has zero images. Returning Stage 1 results & initial K/D.")
+        return T_ego_cam_from_stage1, K_initial_sensor, initial_D_sensor_coeffs, dt_init_for_final_ls_map, None
+
+    # Initial guess x0 for final LS
+    xi_ego_cam_ls_init = xi_ego_cam_from_stage1 # From Stage 1
+    k_params_ls_init = np.array([
+        K_sensor_ls_init[0,0], K_sensor_ls_init[1,1],
+        K_sensor_ls_init[0,2], K_sensor_ls_init[1,2]
+    ])
+    d_params_ls_init = D_sensor_ls_init_flat
+    
+    dt_ls_init_seconds_vec = np.zeros(opt_data_final_ls.num_opt_images)
+    for i, img_idx_in_opt_data in enumerate(opt_data_final_ls.image_indices):
+        dt_ls_init_seconds_vec[i] = dt_init_for_final_ls_map.get(img_idx_in_opt_data, 0.0)
+    x0_final_ls = np.concatenate((xi_ego_cam_ls_init, k_params_ls_init, d_params_ls_init, dt_ls_init_seconds_vec))
+
+    # Bounds for final LS
+    bounds_ls_low = []
+    bounds_ls_high = []
+
+    # Extrinsics (T_ego_cam) bounds: centered at Stage 1 result, with Stage 1's DE exploration offset
+    # This means LS can explore the same range for T_ego_cam as DE did around its center.
+    final_ls_xi_bounds_abs_offset = stage1_de_xi_bounds_abs_offset # Use same offset as Stage 1 DE
+    bounds_ls_low.extend(list(xi_ego_cam_ls_init - final_ls_xi_bounds_abs_offset))
+    bounds_ls_high.extend(list(xi_ego_cam_ls_init + final_ls_xi_bounds_abs_offset))
+    logging.info(f"Stage 2 LS: Extrinsic (xi) bounds centered at Stage 1 DE result +/- {final_ls_xi_bounds_abs_offset}")
+
+    # Intrinsics (K, D) bounds: centered at *initial config values*, using `final_ls_intrinsic_bounds_from_config`
+    if final_ls_intrinsic_bounds_from_config is None:
+        logging.warning("`final_ls_intrinsic_bounds_from_config` not provided. Using wider default intrinsic bounds for LS.")
+        # Fallback to wider default K bounds (e.g., +/- 10% for f, +/- 50px for c)
+        k_ls_b_low_default = [k_params_ls_init[0]*0.9, k_params_ls_init[1]*0.9, k_params_ls_init[2]-50, k_params_ls_init[3]-50]
+        k_ls_b_high_default = [k_params_ls_init[0]*1.1, k_params_ls_init[1]*1.1, k_params_ls_init[2]+50, k_params_ls_init[3]+50]
+        bounds_ls_low.extend(k_ls_b_low_default)
+        bounds_ls_high.extend(k_ls_b_high_default)
+        if num_d_params > 0: # Fallback to wider D bounds
+            d_abs_init = np.abs(d_params_ls_init)
+            bounds_ls_low.extend(list(d_params_ls_init - 0.3 * d_abs_init - 0.02))
+            bounds_ls_high.extend(list(d_params_ls_init + 0.3 * d_abs_init + 0.02))
+    else:
+        cfg_bounds_ls = final_ls_intrinsic_bounds_from_config
+        k_bounds_ls_low_cfg = cfg_bounds_ls.get('k_low', k_params_ls_init * 0.98) # Default to init +/- 2%
+        k_bounds_ls_high_cfg = cfg_bounds_ls.get('k_high', k_params_ls_init * 1.02)
+        d_bounds_ls_low_cfg = cfg_bounds_ls.get('d_low', d_params_ls_init - 0.01) if num_d_params > 0 else []
+        d_bounds_ls_high_cfg = cfg_bounds_ls.get('d_high', d_params_ls_init + 0.01) if num_d_params > 0 else []
+        
+        # Ensure these bounds from config are arrays of correct length
+        # (k_params_ls_init is length NUM_K_PARAMS, d_params_ls_init is length num_d_params)
+        # This assumes cfg_intrinsic_bounds provides flat lists/arrays for k_low/high and d_low/high
+        if len(k_bounds_ls_low_cfg) == NUM_K_PARAMS: bounds_ls_low.extend(k_bounds_ls_low_cfg)
+        else: bounds_ls_low.extend(k_params_ls_init * 0.98) # Fallback
+        if len(k_bounds_ls_high_cfg) == NUM_K_PARAMS: bounds_ls_high.extend(k_bounds_ls_high_cfg)
+        else: bounds_ls_high.extend(k_params_ls_init * 1.02) # Fallback
+
+        if num_d_params > 0:
+            if len(d_bounds_ls_low_cfg) == num_d_params: bounds_ls_low.extend(d_bounds_ls_low_cfg)
+            else: bounds_ls_low.extend(d_params_ls_init - 0.01) # Fallback
+            if len(d_bounds_ls_high_cfg) == num_d_params: bounds_ls_high.extend(d_bounds_ls_high_cfg)
+            else: bounds_ls_high.extend(d_params_ls_init + 0.01) # Fallback
+        logging.info(f"Stage 2 LS: Using intrinsic bounds from config (relative to initial K/D).")
+
+    # dt bounds (same as before)
+    bounds_ls_low.extend([final_ls_dt_bounds_seconds[0]] * opt_data_final_ls.num_opt_images)
+    bounds_ls_high.extend([final_ls_dt_bounds_seconds[1]] * opt_data_final_ls.num_opt_images)
+    bounds_final_ls_staged = (bounds_ls_low, bounds_ls_high)
+
+    # (f_scale_final_ls, initial cost calculation, least_squares call, and result unpacking remain the same
+    #  as in the previous refine_parameters_de_extr_then_ls_joint)
+    f_scale_final_ls = de_robust_loss_scale
+    try:
+        initial_final_ls_residuals = compute_residuals(x0_final_ls, opt_data_final_ls)
+        initial_final_ls_cost_robust = calculate_robust_cost_for_de(
+            initial_final_ls_residuals, final_ls_loss_function, f_scale_final_ls
+        )
+        logging.info(f"Stage 2 LS: Initial cost (robust '{final_ls_loss_function}' eval, scale={f_scale_final_ls}): {initial_final_ls_cost_robust:.4e}")
+    except Exception as e_ls_init_cost:
+        logging.error(f"Failed to compute initial cost for Stage 2 LS: {e_ls_init_cost}. Returning Stage 1 T_ego_cam & initial K/D.", exc_info=True)
+        return T_ego_cam_from_stage1, K_initial_sensor, initial_D_sensor_coeffs, dt_init_for_final_ls_map, None
+
+    final_ls_result_obj = None
+    try:
+        final_ls_result_obj = least_squares(
+            compute_residuals, x0_final_ls, jac='2-point', bounds=bounds_final_ls_staged, method='trf',
+            ftol=1e-8, xtol=1e-8, gtol=1e-8,
+            loss=final_ls_loss_function, f_scale=f_scale_final_ls,
+            verbose=final_ls_verbose,
+            max_nfev=2000 * len(x0_final_ls), 
+            args=(opt_data_final_ls,)
+        )
+        logging.info(f"Stage 2 LS optimization finished. Status: {final_ls_result_obj.status} ({final_ls_result_obj.message})")
+        logging.info(f"Stage 2 LS cost: {final_ls_result_obj.cost:.4e}. Optimality: {final_ls_result_obj.optimality:.4e}")
+    except Exception as e_ls_final:
+        logging.error(f"Stage 2 LS optimization crashed: {e_ls_final}. Returning Stage 1 T_ego_cam & initial K/D.", exc_info=True)
+        return T_ego_cam_from_stage1, K_initial_sensor, initial_D_sensor_coeffs, dt_init_for_final_ls_map, None
+
+    T_ego_cam_final_refined = T_ego_cam_from_stage1
+    K_sensor_final_refined = K_initial_sensor
+    D_sensor_final_refined = initial_D_sensor_coeffs
+    final_refined_delta_t_map = dt_init_for_final_ls_map
+
+    if final_ls_result_obj and (final_ls_result_obj.success or final_ls_result_obj.cost < initial_final_ls_cost_robust * 0.999):
+        X_ls_final = final_ls_result_obj.x
+        T_ego_cam_final_refined = se3_to_SE3(X_ls_final[:6])
+        k_final_params = X_ls_final[6:6+NUM_K_PARAMS]
+        K_sensor_final_refined = np.array([[k_final_params[0], 0, k_final_params[2]],
+                                           [0, k_final_params[1], k_final_params[3]],
+                                           [0,0,1]])
+        D_sensor_final_refined_flat = X_ls_final[6+NUM_K_PARAMS : 6+NUM_K_PARAMS+num_d_params]
+        D_sensor_final_refined = D_sensor_final_refined_flat
+        
+        dt_final_seconds_flat = X_ls_final[6+NUM_K_PARAMS+num_d_params:]
+        for i, img_idx_in_opt_data in enumerate(opt_data_final_ls.image_indices):
+            if img_idx_in_opt_data in final_refined_delta_t_map:
+                 final_refined_delta_t_map[img_idx_in_opt_data] = dt_final_seconds_flat[i]
+        logging.info("Successfully refined all parameters using 2-Stage optimization.")
+    else:
+        logging.warning("Stage 2 LS did not improve significantly or failed. Returning Stage 1 T_ego_cam, initial K/D, and pre-LS dt map.")
+
+    logging.info(f"Final Refined T_ego_cam (2-Stage):\n{np.round(T_ego_cam_final_refined, 6)}")
+    logging.info(f"Final Refined K_sensor (2-Stage):\n{np.round(K_sensor_final_refined, 4)}")
+    if D_sensor_final_refined is not None and D_sensor_final_refined.size > 0:
+        logging.info(f"Final Refined D_sensor (2-Stage):\n{np.round(D_sensor_final_refined, 7)}")
+
+    return T_ego_cam_final_refined, K_sensor_final_refined, D_sensor_final_refined, final_refined_delta_t_map, final_ls_result_obj
+
+# --- Hybrid Refinement Function ---
+def refine_all_parameters_hybrid(
+    initial_T_ego_cam_from_config: np.ndarray,
+    pnp_derived_T_ego_cam_guess: np.ndarray,
+    inlier_matches_map_undistorted_ideal: dict,
+    ego_timestamps_us: np.ndarray,
+    ego_poses: list,
+    query_indices_for_opt: list,
+    query_timestamps_rec_us: dict,
+    K_initial_ideal_for_undistorted_input: np.ndarray,
+    initial_D_sensor_coeffs: np.ndarray,
+    model_type: str,
+    img_width: int, img_height: int,
+    dt_bounds_seconds_de_inner_opt: tuple[float, float] = (-0.02, 0.02),
+    dt_bounds_seconds_final_ls: tuple[float, float] = (-0.05, 0.05),
+    # --- Robust Loss Parameters ---
+    de_robust_loss_type: str = 'cauchy',         # Robust loss for DE objective
+    de_robust_loss_scale: float = 5.0,           # Scale for DE robust loss (e.g., pixel error)
+    loss_function_final_ls: str = 'cauchy',      # Robust loss for final least_squares
+    # --- End Robust Loss Parameters ---
+    final_ls_verbose: int = 1,
+    interpolation_tolerance_us: int = 1,
+    intrinsic_bounds_config: dict = None,
+    de_popsize_factor: int = 15,
+    de_maxiter: int = 150,
+    de_workers: int = -1,
+    debug_opt_data_vis_params: dict = None
+):
+    logging.info("--- Starting HYBRID Extrinsics, Intrinsics, and Timestamp Refinement ---")
+    logging.info(f"DE Robust Loss: Type='{de_robust_loss_type}', Scale={de_robust_loss_scale}")
+    logging.info(f"Final LS Robust Loss: Type='{loss_function_final_ls}' (f_scale for LS is internally handled or can be passed via least_squares_kwargs if needed)")
+
+    # ... (initial setup, num_d_params, T_ego_cam_for_de_center, xi_ego_cam_de_initial, k_params_init_ideal remains the same) ...
+    num_query_images_for_opt = len(query_indices_for_opt)
+    if num_query_images_for_opt == 0:
+        logging.error("No query images provided for hybrid refinement.")
+        return None, None, None, None, None
+
+    num_d_params = 0
+    d_params_init_sensor = np.array([])
+    if initial_D_sensor_coeffs is not None:
+        d_params_init_sensor = initial_D_sensor_coeffs.flatten()
+        num_d_params = len(d_params_init_sensor)
+
+    T_ego_cam_for_de_center = initial_T_ego_cam_from_config
+    # if pnp_derived_T_ego_cam_guess is not None:
+    #     try:
+    #         if np.isclose(np.linalg.det(pnp_derived_T_ego_cam_guess[:3,:3]), 1.0):
+    #             T_ego_cam_for_de_center = pnp_derived_T_ego_cam_guess
+    #             logging.info("Using PnP-derived T_ego_cam as center for DE search.")
+    #         else:
+    #             logging.warning("PnP-derived T_ego_cam has invalid determinant. Falling back to config T_ego_cam for DE center.")
+    #     except Exception:
+    #         logging.warning("Error validating PnP-derived T_ego_cam. Falling back to config T_ego_cam for DE center.")
+    # else:
+    #     logging.info("No PnP-derived T_ego_cam provided. Using config T_ego_cam as center for DE search.")
+    
+    try:
+        xi_ego_cam_de_initial = SE3_to_se3(T_ego_cam_for_de_center)
+    except Exception as e_se3:
+        logging.error(f"Failed to convert T_ego_cam_for_de_center to se3: {e_se3}. Using identity for xi initial.")
+        xi_ego_cam_de_initial = np.zeros(6)
+
+    k_params_init_ideal = np.array([
+        K_initial_ideal_for_undistorted_input[0, 0], K_initial_ideal_for_undistorted_input[1, 1],
+        K_initial_ideal_for_undistorted_input[0, 2], K_initial_ideal_for_undistorted_input[1, 2]
+    ])
+
+    # ... (DE bounds setup: bounds_de_xi_low/high, bounds_de_k_low/high, bounds_de_d_low/high remains the same) ...
+    bounds_de_xi_low = xi_ego_cam_de_initial - np.array([0.1, 0.1, 0.1, 0.2, 0.2, 0.2]) # Example bounds
+    bounds_de_xi_high = xi_ego_cam_de_initial + np.array([0.1, 0.1, 0.1, 0.2, 0.2, 0.2])
+
+    cfg_bounds = intrinsic_bounds_config if intrinsic_bounds_config else {}
+    k_b_low_default = [ max(10.0, k_params_init_ideal[0] * 0.8), max(10.0, k_params_init_ideal[1] * 0.8), 
+                        k_params_init_ideal[2] - 0.15 * img_width, k_params_init_ideal[3] - 0.15 * img_height ]
+    k_b_high_default = [ k_params_init_ideal[0] * 1.2, k_params_init_ideal[1] * 1.2, 
+                         k_params_init_ideal[2] + 0.15 * img_width, k_params_init_ideal[3] + 0.15 * img_height ]
+    bounds_de_k_low = np.array(cfg_bounds.get('k_low', k_b_low_default))
+    bounds_de_k_high = np.array(cfg_bounds.get('k_high', k_b_high_default))
+
+    d_b_low_def, d_b_high_def = [], []
+    if num_d_params > 0: # Default bounds for D, can be overridden by intrinsic_bounds_config
+        if model_type == "KANNALA_BRANDT":
+            # Wider range for DE exploration
+            d_b_low_def  = d_params_init_sensor - np.array([0.15, 0.08, 0.03, 0.03]) 
+            d_b_high_def = d_params_init_sensor + np.array([0.15, 0.08, 0.03, 0.03])
+        elif model_type == "PINHOLE":
+            if num_d_params == 4: # k1,k2,p1,p2
+                 d_b_low_def  = d_params_init_sensor - np.array([0.25, 0.15, 0.008, 0.008])
+                 d_b_high_def = d_params_init_sensor + np.array([0.25, 0.15, 0.008, 0.008])
+            elif num_d_params == 5: # k1,k2,p1,p2,k3
+                 d_b_low_def  = d_params_init_sensor - np.array([0.25, 0.15, 0.008, 0.008, 0.15])
+                 d_b_high_def = d_params_init_sensor + np.array([0.25, 0.15, 0.008, 0.008, 0.15])
+            else: # Generic wide bounds
+                 d_b_low_def  = d_params_init_sensor - 0.3 * np.abs(d_params_init_sensor) - 0.1
+                 d_b_high_def = d_params_init_sensor + 0.3 * np.abs(d_params_init_sensor) + 0.1
+        else: # Fallback
+            d_b_low_def = d_params_init_sensor - 0.15
+            d_b_high_def = d_params_init_sensor + 0.15
+            
+    bounds_de_d_low = np.array(cfg_bounds.get('d_low', d_b_low_def))
+    bounds_de_d_high = np.array(cfg_bounds.get('d_high', d_b_high_def))
+    # Ensure low < high for D bounds
+    for i in range(len(bounds_de_d_low)):
+        if bounds_de_d_low[i] >= bounds_de_d_high[i]:
+            mid_val = (bounds_de_d_low[i] + bounds_de_d_high[i]) / 2.0
+            bounds_de_d_low[i] = mid_val - 0.01 # Ensure a small spread
+            bounds_de_d_high[i] = mid_val + 0.01
+
+    de_bounds_list = list(zip(np.concatenate((bounds_de_xi_low, bounds_de_k_low, bounds_de_d_low)),
+                              np.concatenate((bounds_de_xi_high, bounds_de_k_high, bounds_de_d_high))))
+    
+    de_objective_data_for_call = {
+        "inlier_matches_map_undistorted_ideal": inlier_matches_map_undistorted_ideal,
+        "query_indices_for_opt": query_indices_for_opt,
+        "query_timestamps_rec_us": query_timestamps_rec_us,
+        "ego_interpolator_us": functools.partial(get_pose_for_timestamp, timestamps_us=ego_timestamps_us, poses=ego_poses, tolerance_us=interpolation_tolerance_us),
+        "K_initial_ideal_for_undistorted_input": K_initial_ideal_for_undistorted_input,
+        "model_type": model_type,
+        "img_width": img_width,
+        "img_height": img_height,
+        "dt_bounds_seconds_de_inner_opt": dt_bounds_seconds_de_inner_opt,
+        "num_d_params": num_d_params,
+        # Add DE robust loss parameters
+        "de_robust_loss_type": de_robust_loss_type,
+        "de_robust_loss_scale": de_robust_loss_scale,
+        "de_popsize_factor_for_log": de_popsize_factor # For logging inside objective if needed
+    }
+    
+    logging.info(f"Running Differential Evolution (PopFactor={de_popsize_factor}, MaxIter={de_maxiter}, Workers={de_workers})...")
+    logging.info(f"DE Objective using Robust Loss: Type='{de_robust_loss_type}', Scale={de_robust_loss_scale}")
+    de_start_time = time.time()
+    
+    de_result = differential_evolution(
+        de_objective_func_global,
+        bounds=de_bounds_list,
+        args=(de_objective_data_for_call,),
+        strategy='best1bin', maxiter=de_maxiter, popsize=de_popsize_factor,
+        tol=0.01, mutation=(0.5, 1), recombination=0.7, # Standard DE params
+        polish=False, disp=True, workers=de_workers, updating='deferred' # 'deferred' often better with workers
+    )
+    de_duration = time.time() - de_start_time
+    logging.info(f"Differential Evolution finished in {de_duration:.2f}s. Final avg robust cost: {de_result.fun:.6e}")
+
+    # ... (Unpacking DE results, calculating optimal dt_i values based on DE's best, logging remains the same) ...
+    if not de_result.success:
+        logging.warning(f"Differential Evolution did not converge successfully: {de_result.message}")
+        # Decide if to proceed or use initial if DE failed badly. For now, proceed with DE's best.
+        logging.warning("Proceeding with DE's best found parameters for final LS, but results may be suboptimal.")
+
+    X_de_best = de_result.x
+    xi_ego_cam_best_de = X_de_best[:6]
+    k_params_sensor_best_de = X_de_best[6:6+NUM_K_PARAMS]
+    d_params_sensor_best_de = X_de_best[6+NUM_K_PARAMS : 6+NUM_K_PARAMS+num_d_params]
+
+    T_ego_cam_best_de = se3_to_SE3(xi_ego_cam_best_de)
+    K_sensor_best_de = np.array([[k_params_sensor_best_de[0], 0, k_params_sensor_best_de[2]],
+                                 [0, k_params_sensor_best_de[1], k_params_sensor_best_de[3]],
+                                 [0, 0, 1]])
+
+    logging.info(f"Best T_ego_cam from DE:\n{np.round(T_ego_cam_best_de,5)}")
+    logging.info(f"Best K_sensor from DE:\n{np.round(K_sensor_best_de,4)}")
+    logging.info(f"Best D_sensor from DE: {np.round(d_params_sensor_best_de,6)}")
+
+    logging.info("Calculating optimal dt_i values based on DE's best global parameters for LS initialization...")
+    dt_best_de_map_seconds = {}
+    for img_idx in query_indices_for_opt: # Iterate over images considered for optimization
+        p2d_undist_ideal_kps_img, P3d_world_img = inlier_matches_map_undistorted_ideal[img_idx]
+        if p2d_undist_ideal_kps_img.shape[0] == 0: # Should not happen if query_indices_for_opt is pre-filtered
+            dt_best_de_map_seconds[img_idx] = 0.0; continue
+        
+        t_rec_us_img = query_timestamps_rec_us[img_idx]
+
+        p2d_target_distorted_for_final_dt = generate_target_distorted_points(
+            p2d_undist_ideal_kps_img, K_sensor_best_de, d_params_sensor_best_de,
+            model_type, K_initial_ideal_for_undistorted_input, img_width, img_height
+        )
+        if p2d_target_distorted_for_final_dt.shape[0] == 0: # Should be handled by generate_target
+            dt_best_de_map_seconds[img_idx] = 0.0; continue
+
+        # This inner LS uses 'linear' loss as per refine_timestamp_only_revised_for_de default
+        dt_opt_s, _, _, _, _ = refine_timestamp_only_revised_for_de(
+            T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, model_type,
+            img_width, img_height,
+            p2d_target_distorted_for_final_dt, P3d_world_img, t_rec_us_img,
+            de_objective_data_for_call["ego_interpolator_us"],
+            dt_bounds_seconds=dt_bounds_seconds_de_inner_opt, # Use inner opt bounds
+            loss_function='linear' # Explicitly linear for speed here
+        )
+        dt_best_de_map_seconds[img_idx] = dt_opt_s if dt_opt_s is not None else 0.0
+
+    # --- Final least_squares Fine-tuning ---
+    # The OptimizationData and compute_residuals for this final LS step are standard (non-robust cost internally).
+    # The `loss_function_final_ls` parameter to `least_squares` handles robustness here.
+    logging.info("--- Starting Final least_squares Fine-tuning ---")
+    logging.info(f"Final LS using Robust Loss: Type='{loss_function_final_ls}'")
+    try:
+        opt_data_final_ls = OptimizationData(
+            inlier_matches_map_us=inlier_matches_map_undistorted_ideal, # Using all PnP-successful images
+            ego_interpolator_us=de_objective_data_for_call["ego_interpolator_us"],
+            K_initial_ideal=K_sensor_best_de,       # Start K from DE's best K_sensor
+            # K_initial_ideal=K_initial_ideal_for_undistorted_input,
+            D_initial_sensor=d_params_sensor_best_de, # Start D from DE's best D_sensor
+            # D_initial_sensor=initial_D_sensor_coeffs,
+            model_type=model_type,
+            img_width=img_width, img_height=img_height,
+            t_rec_map_us=query_timestamps_rec_us, # For all PnP-successful images
+            num_images_passed_to_constructor=len(query_indices_for_opt),
+            debug_image_idx_to_name_map=debug_opt_data_vis_params.get('image_idx_to_name_map') if debug_opt_data_vis_params else None,
+            debug_query_image_dir=debug_opt_data_vis_params.get('query_image_dir') if debug_opt_data_vis_params else None,
+            debug_output_vis_dir=debug_opt_data_vis_params.get('output_vis_dir') if debug_opt_data_vis_params else None,
+            debug_vis_image_indices=debug_opt_data_vis_params.get('vis_image_indices') if debug_opt_data_vis_params else []
+        )
+    except Exception as e_optdata:
+        logging.error(f"Failed to create OptimizationData for final LS: {e_optdata}", exc_info=True)
+        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, dt_best_de_map_seconds, de_result
+
+    if opt_data_final_ls.num_opt_images == 0: # Check if opt_data itself filtered out all images
+        logging.error("OptData for final LS has zero images. Cannot run final LS. Returning DE results.")
+        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, dt_best_de_map_seconds, de_result
+
+    xi_ego_cam_ls_init = xi_ego_cam_best_de
+    # k_params for LS init are from K_sensor_best_de
+    k_params_ls_init = np.array([K_sensor_best_de[0,0], K_sensor_best_de[1,1], K_sensor_best_de[0,2], K_sensor_best_de[1,2]])
+    d_params_ls_init = d_params_sensor_best_de # This is already flat
+    
+    # Initialize dt for LS from the dt_best_de_map_seconds, ordered by opt_data_final_ls.image_indices
+    dt_ls_init_seconds = np.zeros(opt_data_final_ls.num_opt_images)
+    for i, img_idx_in_opt_data in enumerate(opt_data_final_ls.image_indices):
+        dt_ls_init_seconds[i] = dt_best_de_map_seconds.get(img_idx_in_opt_data, 0.0)
+
+    x0_ls = np.concatenate((xi_ego_cam_ls_init, k_params_ls_init, d_params_ls_init, dt_ls_init_seconds))
+
+    # ... (Bounds for final LS: bounds_ls_low, bounds_ls_high, bounds_final_ls remains the same) ...
+    # Tighter bounds for LS, centered around DE's solution
+    bounds_ls_low = list(xi_ego_cam_ls_init - np.array([0.03, 0.03, 0.03, 0.08, 0.08, 0.08])) # Tighter than DE
+    bounds_ls_high = list(xi_ego_cam_ls_init + np.array([0.03, 0.03, 0.03, 0.08, 0.08, 0.08]))
+
+    # K bounds for LS, tighter around k_params_ls_init
+    k_ls_b_low = list(k_params_ls_init * 0.98) # e.g., +/- 2%
+    k_ls_b_high = list(k_params_ls_init * 1.02)
+    # Ensure cx, cy stay within image (can be relaxed if principal point can be outside)
+    k_ls_b_low[2] = max(0, k_params_ls_init[2] - 0.05 * img_width) 
+    k_ls_b_high[2] = min(img_width-1, k_params_ls_init[2] + 0.05 * img_width)
+    k_ls_b_low[3] = max(0, k_params_ls_init[3] - 0.05 * img_height)
+    k_ls_b_high[3] = min(img_height-1, k_params_ls_init[3] + 0.05 * img_height)
+    bounds_ls_low.extend(k_ls_b_low)
+    bounds_ls_high.extend(k_ls_b_high)
+
+    if num_d_params > 0:
+        # D bounds for LS, tighter around d_params_ls_init
+        d_abs = np.abs(d_params_ls_init)
+        d_ls_b_low = list(d_params_ls_init - 0.05 * d_abs - 0.008) # e.g. +/- 5% of value + small constant
+        d_ls_b_high = list(d_params_ls_init + 0.05 * d_abs + 0.008)
+        for i_d in range(len(d_ls_b_low)): # Ensure low < high
+            if d_ls_b_low[i_d] >= d_ls_b_high[i_d]:
+                d_mid = (d_ls_b_low[i_d] + d_ls_b_high[i_d])/2.0
+                d_ls_b_low[i_d] = d_mid - 1e-4; d_ls_b_high[i_d] = d_mid + 1e-4
+        bounds_ls_low.extend(d_ls_b_low)
+        bounds_ls_high.extend(d_ls_b_high)
+
+    bounds_ls_low.extend([dt_bounds_seconds_final_ls[0]] * opt_data_final_ls.num_opt_images)
+    bounds_ls_high.extend([dt_bounds_seconds_final_ls[1]] * opt_data_final_ls.num_opt_images)
+    bounds_final_ls = (bounds_ls_low, bounds_ls_high)
+
+    # For `least_squares`, `f_scale` is used with robust loss functions.
+    # A common choice for f_scale is related to the expected stddev of inlier residuals (in pixels).
+    # If `de_robust_loss_scale` was a pixel error (e.g. 5.0 pixels), it can be used here.
+    f_scale_for_ls = de_robust_loss_scale # Use the same scale as DE for consistency if applicable
+                                        # or make it a new parameter `final_ls_f_scale`.
+
+    try:
+        initial_ls_residuals = compute_residuals(x0_ls, opt_data_final_ls)
+        # Cost for 'linear' loss. If final_ls is robust, this is just for reference.
+        initial_ls_cost_linear = 0.5 * np.sum(initial_ls_residuals**2)
+        # Calculate initial cost with the *actual* robust loss chosen for final_ls
+        initial_ls_cost_robust = calculate_robust_cost_for_de(initial_ls_residuals, loss_function_final_ls, f_scale_for_ls)
+        logging.info(f"Final LS: Initial cost (from DE best, linear eval): {initial_ls_cost_linear:.4e}")
+        logging.info(f"Final LS: Initial cost (from DE best, robust '{loss_function_final_ls}' eval, scale={f_scale_for_ls}): {initial_ls_cost_robust:.4e}")
+
+    except Exception as e_ls_init_cost:
+        logging.error(f"Failed to compute initial cost for final LS: {e_ls_init_cost}. Returning DE results.", exc_info=True)
+        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, dt_best_de_map_seconds, de_result
+        
+    final_ls_result_obj = None
+    try:
+        # The `loss` parameter in `least_squares` handles the robust cost function application.
+        # `f_scale` is crucial for 'huber', 'cauchy', 'arctan', 'soft_l1'.
+        final_ls_result_obj = least_squares(
+            compute_residuals, x0_ls, jac='2-point', bounds=bounds_final_ls, method='trf',
+            ftol=1e-9, xtol=1e-9, gtol=1e-9,
+            loss=loss_function_final_ls, # This enables robust loss
+            f_scale=f_scale_for_ls,     # Scale for the robust loss function
+            verbose=final_ls_verbose,
+            max_nfev=2000 * len(x0_ls), 
+            args=(opt_data_final_ls,)
+        )
+        logging.info(f"Final LS optimization finished. Status: {final_ls_result_obj.status} ({final_ls_result_obj.message})")
+        logging.info(f"Final LS cost (using '{loss_function_final_ls}' with f_scale={f_scale_for_ls}): {final_ls_result_obj.cost:.4e}. Optimality: {final_ls_result_obj.optimality:.4e}")
+    except Exception as e_ls_final:
+        logging.error(f"Final LS optimization crashed: {e_ls_final}. Returning DE results.", exc_info=True)
+        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, dt_best_de_map_seconds, de_result
+
+    # Compare final LS cost with the initial cost *evaluated using the same robust loss and scale*
+    if final_ls_result_obj.success or final_ls_result_obj.cost < initial_ls_cost_robust:
+        X_ls_final = final_ls_result_obj.x
+        T_ego_cam_final = se3_to_SE3(X_ls_final[:6])
+        k_final = X_ls_final[6:6+NUM_K_PARAMS]
+        K_sensor_final = np.array([[k_final[0], 0, k_final[2]], [0, k_final[1], k_final[3]], [0,0,1]])
+        D_sensor_final = X_ls_final[6+NUM_K_PARAMS : 6+NUM_K_PARAMS+num_d_params]
+        
+        dt_final_seconds_flat = X_ls_final[6+NUM_K_PARAMS+num_d_params:]
+        final_refined_delta_t_map_seconds = {idx: 0.0 for idx in query_indices_for_opt} # Initialize for all
+        # Populate using opt_data_final_ls.image_indices which are the ones optimized in LS
+        for i, img_idx_in_opt_data in enumerate(opt_data_final_ls.image_indices):
+            if img_idx_in_opt_data in final_refined_delta_t_map_seconds: # Should always be true
+                 final_refined_delta_t_map_seconds[img_idx_in_opt_data] = dt_final_seconds_flat[i]
+        
+        logging.info("Successfully refined all parameters using DE + LS.")
+        return T_ego_cam_final, K_sensor_final, D_sensor_final, final_refined_delta_t_map_seconds, final_ls_result_obj
+    else:
+        logging.warning(f"Final LS did not improve upon DE result (Robust Cost DE: {initial_ls_cost_robust:.4e} vs LS: {final_ls_result_obj.cost:.4e}) or failed. Returning DE best parameters.")
+        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, dt_best_de_map_seconds, de_result
 
 def refine_all_parameters(
     initial_T_ego_cam: np.ndarray,
@@ -3362,39 +4858,44 @@ class PnPResult:
     initial_T_map_cam: np.ndarray = None 
 
 def run_pipeline(
-    arg_config,
+    arg_config, # Contains args.steps, args.camera_name, args.num_joint_opt
     lidar_map_file: Path,
     query_image_dir: Path,
     query_image_list_file: Path,
     output_dir: Path,
-    render_poses_list,
+    render_poses_list, # Initial poses for rendering (T_map_cam)
     ego_pose_file: Path,
-    initial_T_ego_cam_guess: np.ndarray,
-    camera_intrinsics_matrix: np.ndarray,
-    camera_distortion_array: np.ndarray,
+    initial_T_ego_cam_guess: np.ndarray, # User-provided/fallback T_sensor_cam
+    camera_intrinsics_matrix_ideal: np.ndarray, # K_ideal (for undistorted images)
+    camera_distortion_array_sensor: np.ndarray, # D_sensor (physical distortion)
     image_width: int, image_height: int,
+    camera_model_type: str, # Added this parameter
     camera_name_in_list: str,
     min_height: float = -2.0, voxel_size: float = 0.03, normal_radius: float = 0.15,
     normal_max_nn: int = 50, device: str = "auto",
     render_shading_mode: str = 'normal', render_point_size: float = 2,
     intensity_highlight_threshold: float = None,
-    feature_conf='superpoint_aachen', matcher_conf='superglue', # matcher_conf not used directly
+    feature_conf='superpoint_aachen', matcher_conf='superglue',
     distance_threshold_px: float = 30.0,
     pnp_iterations: int = 500, pnp_reprojection_error: float = 5.0,
     pnp_confidence: float = 0.999999, pnp_min_inliers: int = 15,
-    dt_bounds_joint_opt: tuple[float, float] = (-0.05, 0.05),
-    opt_verbose: int = 1,
+    dt_bounds_de_inner_opt: tuple[float, float] = (-0.02, 0.02), # For DE inner loop
+    dt_bounds_final_ls: tuple[float, float] = (-0.05, 0.05),     # For final LS
+    final_ls_opt_verbose: int = 1, # Verbosity for final LS
     visualize_steps: bool = True,
     num_images_to_visualize: int = 3,
     visualize_map_point_size: float = 1,
-    loss_function: str = 'cauchy',
+    de_robust_loss_type: str = 'cauchy',
+    de_robust_loss_scale: float = 5.0,
+    loss_function_final_ls: str = 'cauchy', # For final LS
     intrinsic_bounds_config: dict = None,
-    visualize_distortpoints_debug: bool = True, # Add a flag to enable this specific debug
+    visualize_distortpoints_debug: bool = True,
     num_distortpoints_debug_images: int = 1,
+    de_popsize_factor: int = 15, # DE param
+    de_maxiter: int = 150,       # DE param
+    de_workers: int = -1         # DE param
 ):
-    global pnp_min_inliers_global_placeholder # For dummy link_matches_via_depth
-    pnp_min_inliers_global_placeholder = pnp_min_inliers
-
+    # ... (Setup output_dir, hloc_out_dir etc. - REMAINS THE SAME) ...
     output_dir = Path(output_dir)
     hloc_out_dir = output_dir / 'hloc'
     query_image_dir_undistorted = hloc_out_dir / 'query_images_undistorted'
@@ -3419,672 +4920,674 @@ def run_pipeline(
     vis_base_output_dir.mkdir(parents=True, exist_ok=True)
     mid_data_dir.mkdir(parents=True, exist_ok=True)
 
-    feature_output_base_name = 'feats-superpoint-n4096-r1024'
+    feature_output_base_name = 'feats-superpoint-n4096-r1024' # Example
     features_filename = f"{feature_output_base_name}.h5"
     features_path = hloc_out_dir / features_filename
     matches_output_path = hloc_out_dir / 'distance_matches.h5'
-    masked_render_features_path = features_path
+    # masked_render_features_path = features_path # If applying masks modifies the original file
     vis_pnp_output_dir = vis_base_output_dir / 'pnp'
     vis_pnp_output_dir.mkdir(parents=True, exist_ok=True)
+
 
     logging.info("--- 0. Loading Ego Vehicle Poses ---")
     ego_timestamps_us, ego_poses_list = load_and_prepare_ego_poses(ego_pose_file)
     if ego_timestamps_us is None or ego_poses_list is None:
         logging.error(f"Failed to load ego poses from {ego_pose_file}. Aborting.")
         return
-    if len(ego_timestamps_us) != len(ego_poses_list):
-         logging.error("Mismatch between loaded ego timestamps and poses count. Aborting.")
-         return
-    logging.info(f"Loaded {len(ego_timestamps_us)} ego poses.")
+    # Ego interpolator (used by PnP initial guess and refinement)
+    ego_interpolator_us_func = functools.partial(get_pose_for_timestamp, 
+                                             timestamps_us=ego_timestamps_us, 
+                                             poses=ego_poses_list, 
+                                             tolerance_us=1) # Tight tolerance for interpolation
 
-    def interpolate_ego_pose_for_opt_us(query_ts_us, tolerance_us=1):
-        return get_pose_for_timestamp(query_ts_us, ego_timestamps_us, ego_poses_list, tolerance_us=tolerance_us)
-
-    # Initialize variables
+    # --- Initializations for variables used across steps ---
     processed_lidar_data_loaded = None
     rendered_views_info_loaded = None
-    query_image_names = []
-    query_timestamps_rec_us = {}
-    query_name_to_idx = {}
-    query_idx_to_name = {}
-    query_timestamps_rec_us_indexed = {}
-    # Initialize refined_T_ego_cam and final_delta_t_map early
-    refined_T_ego_cam = np.copy(initial_T_ego_cam_guess)
-    final_delta_t_map = {} # Will store {query_idx: dt_seconds}
-    final_refined_poses_cam_map = {} # For final results
+    query_image_names = [] # List of image basenames (e.g., "12345.png")
+    query_idx_to_name = {} # {0: "12345.png", 1: "12346.png", ...}
+    query_name_to_idx = {} # {"12345.png": 0, ...}
+    # query_timestamps_rec_us: {image_basename: timestamp_us} - from filename
+    # query_timestamps_rec_us_indexed: {query_idx: timestamp_us}
+    query_timestamps_rec_us, query_timestamps_rec_us_indexed = {}, {}
+    
+    # Final results to be populated
+    final_refined_T_ego_cam = np.copy(initial_T_ego_cam_guess)
+    final_refined_K_sensor = np.copy(camera_intrinsics_matrix_ideal) # Start K_sensor as K_ideal
+    final_refined_D_sensor = np.copy(camera_distortion_array_sensor) if camera_distortion_array_sensor is not None else np.array([])
+    final_delta_t_map_seconds = {} # {query_idx: dt_seconds}
+    final_refined_poses_cam_map = {} # {image_basename: T_cam_map}
 
+    # --- Step 1: Preprocessing & Rendering ---
     if not arg_config.steps or 1 in arg_config.steps:
-        # ... (Step 1: Preprocessing & Rendering - code remains the same as previous response) ...
         logging.info("--- Running Step 1: Preprocessing & Rendering ---")
         try:
-            pcd_tensor, processed_lidar_data = preprocess_lidar_map(
+            pcd_tensor, processed_lidar_data_runtime = preprocess_lidar_map(
                 lidar_map_file, min_height, normal_radius, normal_max_nn, voxel_size, device
             )
             if pcd_tensor is None: raise RuntimeError("Preprocessing failed.")
         except Exception as e:
             logging.error(f"FATAL: Preprocessing failed: {e}", exc_info=True); return
 
-        rendered_views_info = []
-        if not render_poses_list:
+        rendered_views_info_runtime = []
+        if not render_poses_list: # render_poses_list are T_map_cam
              logging.warning("Render poses list is empty. Skipping rendering step.")
         else:
             with open(render_image_list_path, 'w') as f_list:
-                for i, pose in enumerate(render_poses_list):
+                for i, pose_map_cam_render in enumerate(render_poses_list):
                     render_name = f"render_{i:05d}"
                     logging.info(f"Rendering view {i+1}/{len(render_poses_list)} ({render_name})...")
+                    # Render with K_ideal and D=None (since we render to an ideal pinhole view)
                     render_output = render_geometric_viewpoint_open3d(
-                        pcd_tensor, processed_lidar_data, pose, camera_intrinsics_matrix,
-                        image_width, image_height, shading_mode=render_shading_mode,
-                        point_size=render_point_size, intensity_highlight_threshold=intensity_highlight_threshold
+                        pcd_tensor, processed_lidar_data_runtime, 
+                        pose_map_cam_render, # T_map_cam
+                        camera_intrinsics_matrix_ideal, # K_ideal
+                        image_width, image_height, 
+                        shading_mode=render_shading_mode,
+                        point_size=render_point_size, 
+                        intensity_highlight_threshold=intensity_highlight_threshold
                     )
                     if render_output:
+                        # ... (save rendered outputs - geom, depth, mask) ...
                         geom_img_path = renders_out_dir / f"{render_name}.png"
                         depth_map_path = renders_out_dir / f"{render_name}_depth.npy"
                         mask_path = renders_out_dir / f"{render_name}_mask.png"
-                        try:
-                            if cv2: # Check if cv2 is available (dummy or real)
-                                cv2.imwrite(str(geom_img_path), render_output['geometric_image'])
-                                cv2.imwrite(str(mask_path), render_output['render_mask'])
-                        except Exception as e: logging.warning(f"Error saving render image/mask with cv2: {e}")
+                        cv2.imwrite(str(geom_img_path), render_output['geometric_image'])
+                        cv2.imwrite(str(mask_path), render_output['render_mask'])
                         np.save(str(depth_map_path), render_output['depth'])
                         f_list.write(f"{geom_img_path.name}\n")
-                        rendered_views_info.append({
+                        rendered_views_info_runtime.append({
                             'name': render_name, 'geometric_image_path': geom_img_path,
                             'depth_map_path': depth_map_path, 'mask_path': mask_path,
-                            'pose': render_output['pose']
+                            'pose': render_output['pose'] # This is T_map_cam_render
                         })
-                    else:
-                        logging.warning(f"Failed to render view {i} ({render_name})")
-            if not rendered_views_info and render_poses_list : # Only error if poses were provided but nothing rendered
-                logging.error("FATAL: No views were rendered successfully despite having render poses.")
-                return
-        save_ok = save_processed_data( output_dir=mid_data_dir, processed_lidar_data=processed_lidar_data, rendered_views_info=rendered_views_info )
+                    else: logging.warning(f"Failed to render view {i} ({render_name})")
+            if not rendered_views_info_runtime and render_poses_list:
+                logging.error("FATAL: No views rendered successfully. Aborting."); return
+        
+        save_ok = save_processed_data(
+            output_dir=mid_data_dir, 
+            processed_lidar_data=processed_lidar_data_runtime, 
+            rendered_views_info=rendered_views_info_runtime
+        )
         if not save_ok: logging.warning("Failed to save intermediate processed data.")
-        processed_lidar_data_loaded = processed_lidar_data
-        rendered_views_info_loaded = rendered_views_info
-
-
+        # Update loaded variables for subsequent steps if this step ran
+        processed_lidar_data_loaded = processed_lidar_data_runtime
+        rendered_views_info_loaded = rendered_views_info_runtime
+    
+    # --- Step 2: Feature Extraction & Masking ---
     if not arg_config.steps or 2 in arg_config.steps:
-        # ... (Step 2: Feature Extraction & Masking - code remains the same) ...
+
+        if processed_lidar_data_loaded is None or rendered_views_info_loaded is None:
+             logging.info("Loading processed LiDAR data and Rendered Views Info for Step 3...")
+             processed_lidar_data_loaded, rendered_views_info_loaded = load_processed_data( output_dir=mid_data_dir, rebuild_kdtree=True )
+             if processed_lidar_data_loaded is None: logging.error("Failed to load LiDAR data for PnP."); return
+             # rendered_views_info_loaded can be None if no renders were made, this is handled next.
+             if rendered_views_info_loaded is None and Path(render_image_list_path).exists():
+                 logging.error("Render info file seems to be missing, but render list exists. Data inconsistency.") # Render list might be empty though
+             elif rendered_views_info_loaded is None:
+                 logging.warning("No rendered views info loaded. Distance matching and depth linking will be skipped.")
+
         logging.info("--- Running Step 2: Feature Extraction & Masking ---")
-        if MODEL_TYPE == "KANNALA_BRANDT":
+        # Undistort query images to an ideal pinhole view (using K_ideal, original D_sensor)
+        # Features will be extracted from these undistorted images.
+        logging.info(f"Undistorting query images (Model: {camera_model_type}). Output to: {query_image_dir_undistorted}")
+        query_undistortion_ok = False
+        if camera_model_type == "KANNALA_BRANDT":
             query_undistortion_ok = undistort_images_fisheye(
                 image_list_path=query_image_list_file,
-                original_image_dir=query_image_dir,
-                output_image_dir=query_image_dir_undistorted,
-                K=camera_intrinsics_matrix, D=camera_distortion_array, # D_FISHEYE
-                new_K=camera_intrinsics_matrix, # Undistort to the same K
+                original_image_dir=query_image_dir, # Original distorted images
+                output_image_dir=query_image_dir_undistorted, # Output ideal images
+                K=camera_intrinsics_matrix_ideal, # K of the sensor (approx K_ideal)
+                D=camera_distortion_array_sensor, # D of the sensor
+                new_K=camera_intrinsics_matrix_ideal, # Target K for undistorted (K_ideal)
                 new_size=(image_width, image_height)
             )
-        elif MODEL_TYPE == "PINHOLE":
-            # Implement or call a general undistortion function for Pinhole
-            logging.info(f"Undistorting Pinhole images (K, D_pinhole={camera_distortion_array is not None and camera_distortion_array.size > 0})")
-            # Simplified Pinhole undistortion loop:
-            query_undistortion_ok = True
+        elif camera_model_type == "PINHOLE":
+            query_undistortion_ok = True # Assume true, loop will set false on error
             try:
                 raw_q_names = [line.strip() for line in query_image_list_file.read_text().splitlines() if line.strip()]
                 for q_name in raw_q_names:
                     src_img_path = query_image_dir / q_name
                     dst_img_path = query_image_dir_undistorted / q_name
                     img = cv2.imread(str(src_img_path))
-                    if img is None:
-                        logging.error(f"Failed to load {src_img_path} for pinhole undistortion."); query_undistortion_ok = False; continue
+                    if img is None: query_undistortion_ok = False; continue
                     
-                    # For pinhole, K_MATRIX is the camera matrix.
-                    # camera_distortion_array is D for pinhole (e.g. [k1,k2,p1,p2,k3])
-                    # We undistort to the same K_MATRIX (meaning the ideal pinhole defined by K_MATRIX)
-                    # If camera_distortion_array is None or empty, no distortion to remove for pinhole.
-                    if camera_distortion_array is not None and camera_distortion_array.size > 0:
-                        undist_img = cv2.undistort(img, camera_intrinsics_matrix, camera_distortion_array, None, camera_intrinsics_matrix)
-                    else: # No distortion coeffs provided for pinhole, assume image is already ideal or copy
-                        undist_img = img.copy()
-                    
+                    # Undistort from K_ideal, D_sensor To K_ideal, D_none
+                    # Note: For Pinhole, camera_intrinsics_matrix_ideal is K of sensor if D_sensor is also for it.
+                    # If D_sensor is None/empty, it's already ideal.
+                    undist_img = cv2.undistort(img, camera_intrinsics_matrix_ideal, 
+                                               camera_distortion_array_sensor, # D_sensor
+                                               None, camera_intrinsics_matrix_ideal) # Target K_ideal
                     cv2.imwrite(str(dst_img_path), undist_img)
-            except Exception as e:
-                logging.error(f"Error during Pinhole undistortion: {e}", exc_info=True)
-                query_undistortion_ok = False
+            except Exception as e_undist: query_undistortion_ok = False; logging.error(f"Pinhole undistortion error: {e_undist}")
+        
         if not query_undistortion_ok: logging.error("Query image undistortion failed. Aborting."); return
+        
+        # Extract features (Query from undistorted, Renders from their ideal renders)
+        # (Feature extraction logic - REMAINS THE SAME)
+        if features_path.exists(): logging.warning(f"Deleting existing features file: {features_path}"); features_path.unlink(missing_ok=True) # Py3.8+
+        
         logging.info("Extracting features for UNDISTORTED Query Images...")
-        if features_path.exists(): logging.warning(f"Deleting existing features file: {features_path}"); features_path.unlink()
-        query_extraction_ok = False
-        try:
-            conf_dict = extract_features.confs[str(feature_conf)]; extract_features.main( conf=conf_dict, image_dir=query_image_dir_undistorted, image_list=query_image_list_file, export_dir=hloc_out_dir, feature_path=features_path )
-            if features_path.exists(): query_extraction_ok = True
-            else: logging.error(f"Query feature extraction finished, but output file {features_path} not found!")
-        except Exception as e: logging.error(f"ERROR during Query feature extraction:\n{traceback.format_exc()}")
-        if not query_extraction_ok: logging.error("Query feature extraction failed."); return
+        conf_q = extract_features.confs[str(feature_conf)]
+        extract_features.main(conf=conf_q, image_dir=query_image_dir_undistorted, image_list=query_image_list_file, export_dir=hloc_out_dir, feature_path=features_path )
+        
         logging.info("Extracting features for Rendered Images...")
-        render_extraction_ok = False
-        if not render_image_list_path.exists(): logging.error(f"Render image list {render_image_list_path} not found. Cannot extract render features."); return
-        try:
-            conf_dict = extract_features.confs[str(feature_conf)]; extract_features.main( conf=conf_dict, image_dir=renders_out_dir, image_list=render_image_list_path, export_dir=hloc_out_dir, feature_path=features_path )
-            render_extraction_ok = True
-        except Exception as e: logging.error(f"ERROR during Render feature extraction:\n{traceback.format_exc()}")
-        if not render_extraction_ok: logging.error("Render feature extraction failed."); return
-        logging.info("Applying masks to rendered features...")
-        masking_completed_ok = apply_masks_to_features( feature_file_path=masked_render_features_path, image_list_path=render_image_list_path, image_base_dir=renders_out_dir, mask_suffix=mask_suffix, neighborhood_size=2 )
-        if not masking_completed_ok: logging.warning("Mask application to features reported failure or errors.")
-        logging.info("Checking and fixing features...")
-        check_fix_ok = check_and_fix_features(features_path, 256)
-        if not check_fix_ok: logging.error("Critical errors found during feature check/fix.")
+        if not render_image_list_path.exists() and rendered_views_info_loaded: # If renders were made
+             logging.error(f"Render image list {render_image_list_path} not found, but renders exist. Aborting."); return
+        elif not rendered_views_info_loaded: # No renders were made in step 1
+             logging.warning("No rendered views from Step 1. Skipping render feature extraction and masking.")
+        else: # Renders exist and list should exist
+            conf_r = extract_features.confs[str(feature_conf)]
+            extract_features.main(conf=conf_r, image_dir=renders_out_dir, image_list=render_image_list_path, export_dir=hloc_out_dir, feature_path=features_path )
+            logging.info("Applying masks to rendered features...")
+            apply_masks_to_features( feature_file_path=features_path, image_list_path=render_image_list_path, image_base_dir=renders_out_dir, mask_suffix=mask_suffix, neighborhood_size=2 )
+
+        logging.info("Checking and fixing features format...")
+        check_and_fix_features(features_path, conf_q.get('descriptor_dim', 256)) # Get dim from conf
+        
         if visualize_steps:
+            # (Visualization logic - REMAINS THE SAME)
             visualize_features( h5_feature_path=features_path, image_list_path=query_image_list_file, image_base_dir=query_image_dir_undistorted, vis_output_dir=vis_base_output_dir / 'query_undistorted', num_to_vis=num_images_to_visualize, prefix="query_undistorted_vis" )
-            visualize_features( h5_feature_path=masked_render_features_path, image_list_path=render_image_list_path, image_base_dir=renders_out_dir, vis_output_dir=vis_base_output_dir / 'render_masked', num_to_vis=num_images_to_visualize, prefix="render_masked_vis" )
+            if rendered_views_info_loaded: # Only visualize if renders were made
+                visualize_features( h5_feature_path=features_path, image_list_path=render_image_list_path, image_base_dir=renders_out_dir, vis_output_dir=vis_base_output_dir / 'render_masked', num_to_vis=num_images_to_visualize, prefix="render_masked_vis" )
 
-
+    # --- Step 3: Matching, PnP & Hybrid Refinement ---
     if not arg_config.steps or 3 in arg_config.steps:
-        logging.info("--- Running Step 3: Matching, PnP & Joint Refinement ---")
-        # --- 3.1 Matching ---
-        logging.info("Running Distance-Based Feature Matching...")
-        if not features_path.exists(): logging.error(f"Feature file missing: {features_path}. Cannot match."); return
-        if not render_image_list_path.exists(): logging.error(f"Render image list {render_image_list_path} not found. Cannot match."); return
-        if matches_output_path.exists(): logging.warning(f"Deleting existing matches file: {matches_output_path}"); matches_output_path.unlink()
-        matching_ok = match_by_distance( features_path=features_path, query_image_list_file=query_image_list_file, render_image_list_file=render_image_list_path, matches_output_path=matches_output_path, distance_threshold_px=distance_threshold_px )
-        if not matching_ok: logging.error("Distance matching failed."); return
-
-        # --- 3.2 Load Data (if needed) ---
+        logging.info("--- Running Step 3: Matching, PnP & Hybrid Refinement ---")
+        
+        # --- 3.1 Load Data (if not loaded by step 1) ---
         if processed_lidar_data_loaded is None or rendered_views_info_loaded is None:
-             logging.info("Loading processed data for PnP...")
+             logging.info("Loading processed LiDAR data and Rendered Views Info for Step 3...")
              processed_lidar_data_loaded, rendered_views_info_loaded = load_processed_data( output_dir=mid_data_dir, rebuild_kdtree=True )
-             if processed_lidar_data_loaded is None or rendered_views_info_loaded is None: logging.error("Failed to load processed data for PnP."); return
-             if 'kdtree' not in processed_lidar_data_loaded or processed_lidar_data_loaded['kdtree'] is None: logging.error("KDTree missing from loaded data."); return
+             if processed_lidar_data_loaded is None: logging.error("Failed to load LiDAR data for PnP."); return
+             # rendered_views_info_loaded can be None if no renders were made, this is handled next.
+             if rendered_views_info_loaded is None and Path(render_image_list_path).exists():
+                 logging.error("Render info file seems to be missing, but render list exists. Data inconsistency.") # Render list might be empty though
+             elif rendered_views_info_loaded is None:
+                 logging.warning("No rendered views info loaded. Distance matching and depth linking will be skipped.")
 
-        # --- 3.3 Prepare Query Info ---
+
+        # --- 3.2 Matching (if renders exist) ---
+        if rendered_views_info_loaded and Path(render_image_list_path).exists():
+            logging.info("Running Distance-Based Feature Matching...")
+            if not features_path.exists(): logging.error(f"Feature file missing: {features_path}. Cannot match."); return
+            if matches_output_path.exists(): matches_output_path.unlink(missing_ok=True)
+            
+            match_by_distance( features_path=features_path, query_image_list_file=query_image_list_file, 
+                               render_image_list_file=render_image_list_path, 
+                               matches_output_path=matches_output_path, 
+                               distance_threshold_px=distance_threshold_px )
+        elif not rendered_views_info_loaded:
+            logging.warning("No rendered views available. Skipping feature matching and depth linking. PnP will not be possible.")
+            # If matching is essential, you might want to `return` here.
+        else: # Render list path missing but info loaded implies an issue earlier
+            logging.error(f"Render image list {render_image_list_path} not found, cannot match. Aborting PnP stage."); return
+
+        # --- 3.3 Prepare Query Info (Names, Timestamps) ---
+        # (REMAINS THE SAME as original script)
         logging.info("Reading query image list and parsing timestamps...")
         try:
-            query_image_names.clear(); query_timestamps_rec_us.clear(); query_name_to_idx.clear(); query_idx_to_name.clear(); query_timestamps_rec_us_indexed.clear()
-            raw_query_names = [line.strip() for line in query_image_list_file.read_text().splitlines() if line.strip()]
-            for i, name in enumerate(raw_query_names):
-                try: ts_us = int(Path(name).stem); query_image_names.append(name); query_timestamps_rec_us[name] = ts_us; query_name_to_idx[name] = i; query_idx_to_name[i] = name
-                except ValueError: logging.warning(f"Could not parse timestamp from {name}. Skipping.")
-            if not query_image_names: logging.error("No query images with parseable timestamps found."); return
-            query_timestamps_rec_us_indexed = { query_name_to_idx[name]: ts_us for name, ts_us in query_timestamps_rec_us.items() if name in query_name_to_idx }
-            if len(query_timestamps_rec_us_indexed) != len(query_image_names): logging.warning("Mismatch creating indexed timestamp map.")
-        except Exception as e: logging.error(f"Error reading query list/parsing timestamps: {e}", exc_info=True); return
-
-        # --- 3.4 Initial Visualizations (Optional) ---
-        if visualize_steps:
-             logging.info(f"Generating Initial Map Projection Visualizations ({num_images_to_visualize} images)...")
-             vis_count = 0
-             # Ensure render_poses_list is available and has entries
-             if not render_poses_list:
-                 logging.warning("render_poses_list is empty, cannot generate initial visualizations.")
-             else:
-                 for query_idx in sorted(query_idx_to_name.keys()):
-                     if vis_count >= num_images_to_visualize: break
-                     query_name = query_idx_to_name.get(query_idx)
-                     if not query_name or query_idx >= len(render_poses_list): continue
-                     T_map_cam_initial = render_poses_list[query_idx]
-                     if T_map_cam_initial is None: continue
-                     try: T_cam_map_initial = np.linalg.inv(T_map_cam_initial)
-                     except np.linalg.LinAlgError: continue
-                     img_path_original = query_image_dir / query_name # Path to original distorted image
-                     if not img_path_original.exists(): continue
-                     vis_proj_path = vis_pnp_output_dir / f"{Path(query_name).stem}_{camera_name_in_list}_initial.jpg"
-                     try:
-                         visualize_map_projection(
-                             original_image_path=str(img_path_original),
-                             processed_lidar_data=processed_lidar_data_loaded,
-                             camera_intrinsics_K=camera_intrinsics_matrix, # Initial K
-                             camera_distortion_D=camera_distortion_array,  # Initial D
-                             model_type=MODEL_TYPE,
-                             pose_cam_from_map=T_cam_map_initial,
-                             output_path=str(vis_proj_path),
-                             point_size=int(visualize_map_point_size), # ensure visualize_map_point_size is defined
-                             max_vis_points=500000, # Or from args
-                             filter_distance=50.0 # Or from args
-                         )
-                         vis_count += 1
-                     except Exception as e_vis: logging.error(f"Error visualizing initial map projection for {query_name}: {e_vis}", exc_info=True)
-                 logging.info(f"Finished generating {vis_count} initial visualizations.")
-
-        # --- 3.5 PnP Loop ---
-        logging.info(f"Running PnP RANSAC (min_inliers: {pnp_min_inliers})...")
-        all_pnp_results: list[PnPResult] = []
-        nn_distance_threshold = voxel_size * 2.0
-        for query_name in query_image_names:
-            logging.debug(f"PnP for: {query_name}")
-            query_idx = query_name_to_idx[query_name]
-            # Ensure rendered_views_info_loaded and processed_lidar_data_loaded are valid
-            if rendered_views_info_loaded is None or processed_lidar_data_loaded is None:
-                logging.error("Rendered views or processed LiDAR data not loaded. Cannot link matches."); break
-            query_kps_np, map_points_3d_np = link_matches_via_depth( query_image_name=query_name, features_path=features_path, matches_path=matches_output_path, rendered_views_info=rendered_views_info_loaded, processed_lidar_data=processed_lidar_data_loaded, camera_intrinsics=camera_intrinsics_matrix, nn_distance_threshold=nn_distance_threshold )
-            if query_kps_np.shape[0] < pnp_min_inliers:
-                all_pnp_results.append(PnPResult(query_idx, query_name, False, query_kps_np.shape[0])); continue
-            try:
-                # Ensure cv2.solvePnPRansac is available
-                if not cv2 or not hasattr(cv2, 'solvePnPRansac'):
-                    logging.error("cv2.solvePnPRansac not available. Cannot perform PnP."); break
-                success, rvec, tvec, inliers = cv2.solvePnPRansac( map_points_3d_np.astype(np.float32), query_kps_np.astype(np.float32), camera_intrinsics_matrix, None, iterationsCount=pnp_iterations, reprojectionError=pnp_reprojection_error, confidence=pnp_confidence, flags=getattr(cv2, 'SOLVEPNP_SQPNP', 0) )
-                num_found_inliers = len(inliers) if inliers is not None else 0
-                if success and num_found_inliers >= pnp_min_inliers:
-                    # ... (store PnP result as before) ...
-                    inlier_indices = inliers.flatten(); p2d_inliers = query_kps_np[inlier_indices]; P3d_inliers = map_points_3d_np[inlier_indices]
-                    T_map_cam_pnp = None # Initialize
-                    try: R_mat_pnp, _ = cv2.Rodrigues(rvec); T_cam_map_pnp = np.eye(4); T_cam_map_pnp[:3,:3] = R_mat_pnp; T_cam_map_pnp[:3,3] = tvec.flatten(); T_map_cam_pnp = np.linalg.inv(T_cam_map_pnp)
-                    except Exception: pass # Catch broad errors during inv/rodrigues
-                    all_pnp_results.append(PnPResult(query_idx, query_name, True, num_found_inliers, p2d_inliers, P3d_inliers, T_map_cam_pnp))
-                else: all_pnp_results.append(PnPResult(query_idx, query_name, False, num_found_inliers))
-            except Exception as e: logging.error(f"Error during PnP for {query_name}: {e}", exc_info=True); all_pnp_results.append(PnPResult(query_idx, query_name, False, 0))
-        successful_pnp = [res for res in all_pnp_results if res.success]
-        if not successful_pnp: logging.error("PnP failed for ALL images. Cannot proceed with refinement."); return
-        logging.info(f"PnP successful for {len(successful_pnp)} out of {len(query_image_names)} images.")
-
-        # --- 3.6 Joint Refinement on ALL PnP-successful images ---
-        # `refined_T_ego_cam` initialized with `initial_T_ego_cam_guess` already
-        # --- Prepare debug visualization parameters for OptimizationData ---
-        opt_data_debug_params_for_refinement = None
-        if visualize_distortpoints_debug and query_idx_to_name and successful_pnp: # Check if there are images to visualize
-            # Select a few image indices from PnP successful ones (or all if fewer than num_distortpoints_debug_images)
-            # It's better to visualize images that actually go into optimization
-            indices_for_opt_data_vis = [res.query_idx for res in successful_pnp[:num_distortpoints_debug_images]]
+            query_image_names.clear(); query_idx_to_name.clear(); query_name_to_idx.clear()
+            query_timestamps_rec_us.clear(); query_timestamps_rec_us_indexed.clear()
             
-            if indices_for_opt_data_vis:
-                opt_data_debug_params_for_refinement = {
-                    'image_idx_to_name_map': query_idx_to_name, # Pass the map
-                    'query_image_dir': query_image_dir,         # Pass the original (distorted) image directory
-                    'output_vis_dir': vis_base_output_dir / 'opt_data_distortPoints_debug',
-                    'vis_image_indices': indices_for_opt_data_vis
-                }
-                (vis_base_output_dir / 'opt_data_distortPoints_debug').mkdir(parents=True, exist_ok=True)
-                logging.info(f"Enabling cv2.distortPoints debug visualization for indices: {indices_for_opt_data_vis}")
-        
-        if successful_pnp:
-            logging.info(f"--- Running Joint Extrinsic and Timestamp Refinement on ALL {len(successful_pnp)} PnP-successful Images ---")
-            joint_opt_inlier_matches = {res.query_idx: (res.p2d_inliers, res.P3d_inliers) for res in successful_pnp}
-            joint_opt_indices = [res.query_idx for res in successful_pnp]
-            joint_opt_timestamps_rec_us = {idx: query_timestamps_rec_us_indexed[idx] for idx in joint_opt_indices if idx in query_timestamps_rec_us_indexed}
+            raw_query_names_from_list = [line.strip() for line in query_image_list_file.read_text().splitlines() if line.strip()]
+            for i, name_from_list in enumerate(raw_query_names_from_list):
+                try: 
+                    ts_us = int(Path(name_from_list).stem)
+                    query_image_names.append(name_from_list) # Keep order from list
+                    query_idx_to_name[i] = name_from_list
+                    query_name_to_idx[name_from_list] = i
+                    query_timestamps_rec_us[name_from_list] = ts_us
+                    query_timestamps_rec_us_indexed[i] = ts_us
+                except ValueError: logging.warning(f"Could not parse timestamp from {name_from_list}. Skipping.")
+            
+            if not query_image_names: logging.error("No query images with parseable timestamps found."); return
+        except Exception as e_qlist: logging.error(f"Error processing query list: {e_qlist}", exc_info=True); return
 
-            if len(joint_opt_timestamps_rec_us) != len(joint_opt_indices):
-                 logging.warning("Timestamp records missing for some PnP-successful images. Joint opt will use available ones.")
-                 valid_joint_opt_indices = list(joint_opt_timestamps_rec_us.keys())
-                 joint_opt_inlier_matches = {idx: joint_opt_inlier_matches[idx] for idx in valid_joint_opt_indices}
-                 joint_opt_indices = valid_joint_opt_indices
 
-            if joint_opt_indices: # Ensure there are images to optimize
-                opt_T_ego_cam, opt_K_matrix, opt_D_coeffs, opt_delta_t_map, joint_opt_result_obj = refine_all_parameters(
-                    initial_T_ego_cam=initial_T_ego_cam_guess,
-                    inlier_matches_map=joint_opt_inlier_matches,
+        # --- 3.4 Initial Visualizations (Map Proj using initial T_map_cam from render_poses_list) ---
+        if visualize_steps and render_poses_list:
+            logging.info(f"Generating Initial Map Projection Visualizations ({num_images_to_visualize} images)...")
+            vis_count = 0
+            # Iterate using query_idx_to_name to ensure we match render_poses_list indices
+            for q_idx, q_name in query_idx_to_name.items():
+                if vis_count >= num_images_to_visualize: break
+                if q_idx >= len(render_poses_list): continue # Safety check
+
+                T_map_cam_initial_render = render_poses_list[q_idx] # T_map_cam
+                if T_map_cam_initial_render is None: continue
+                try: T_cam_map_initial_render = np.linalg.inv(T_map_cam_initial_render)
+                except np.linalg.LinAlgError: continue
+                
+                img_path_original_distorted = query_image_dir / q_name
+                if not img_path_original_distorted.exists(): continue
+                
+                vis_proj_path = vis_pnp_output_dir / f"{Path(q_name).stem}_{camera_name_in_list}_initial_map_proj.jpg"
+                visualize_map_projection(
+                     str(img_path_original_distorted), processed_lidar_data_loaded,
+                     camera_intrinsics_matrix_ideal, # Using K_ideal for sensor
+                     camera_distortion_array_sensor, # Using D_sensor
+                     camera_model_type, T_cam_map_initial_render, str(vis_proj_path),
+                     point_size=int(visualize_map_point_size), filter_distance=50.0
+                )
+                vis_count +=1
+            logging.info(f"Finished generating {vis_count} initial map projection visualizations.")
+
+
+        # --- 3.5 PnP Loop (Requires successful matching and depth linking) ---
+        all_pnp_results: list[PnPResult] = []
+        if rendered_views_info_loaded and matches_output_path.exists(): # Only run if matching was done
+            logging.info(f"Running PnP RANSAC (min_inliers: {pnp_min_inliers})...")
+            nn_link_dist_thresh = voxel_size * 2.5 # Slightly increased
+            
+            for q_name in query_image_names: # Iterate through query images that had timestamps
+                q_idx = query_name_to_idx[q_name]
+                
+                # Link matches for this query_name to 3D points
+                # K_ideal is used because features/matches were on undistorted images / ideal renders
+                query_kps_2d_undist, map_points_3d = link_matches_via_depth(
+                    query_image_name=q_name, features_path=features_path, 
+                    matches_path=matches_output_path, 
+                    rendered_views_info=rendered_views_info_loaded, 
+                    processed_lidar_data=processed_lidar_data_loaded, 
+                    camera_intrinsics=camera_intrinsics_matrix_ideal, # K_ideal for linking
+                    nn_distance_threshold=nn_link_dist_thresh,
+                    max_depth_value=100.0
+                )
+
+                if query_kps_2d_undist.shape[0] < pnp_min_inliers:
+                    all_pnp_results.append(PnPResult(q_idx, q_name, False, query_kps_2d_undist.shape[0]))
+                    continue
+                
+                # PnP uses K_ideal and D=None (implicitly, as points are already on ideal image)
+                try:
+                    success_pnp, rvec, tvec, inliers_pnp_indices = cv2.solvePnPRansac(
+                        map_points_3d.astype(np.float32), 
+                        query_kps_2d_undist.astype(np.float32), 
+                        camera_intrinsics_matrix_ideal, # K_ideal for PnP
+                        None, # D=None for PnP on undistorted points
+                        iterationsCount=pnp_iterations, 
+                        reprojectionError=pnp_reprojection_error, 
+                        confidence=pnp_confidence, 
+                        flags=getattr(cv2, 'SOLVEPNP_SQPNP', 0)
+                    )
+                    num_found_inliers = len(inliers_pnp_indices) if inliers_pnp_indices is not None else 0
+                    
+                    if success_pnp and num_found_inliers >= pnp_min_inliers:
+                        p2d_inliers_undist = query_kps_2d_undist[inliers_pnp_indices.flatten()]
+                        P3d_inliers_map = map_points_3d[inliers_pnp_indices.flatten()]
+                        
+                        R_mat_cam_map, _ = cv2.Rodrigues(rvec)
+                        T_cam_map_pnp_mat = np.eye(4)
+                        T_cam_map_pnp_mat[:3,:3] = R_mat_cam_map
+                        T_cam_map_pnp_mat[:3,3] = tvec.flatten()
+                        T_map_cam_pnp_mat = np.linalg.inv(T_cam_map_pnp_mat) # This is T_map_cam
+
+                        all_pnp_results.append(PnPResult(q_idx, q_name, True, num_found_inliers, 
+                                                         p2d_inliers_undist, P3d_inliers_map, 
+                                                         T_map_cam_pnp_mat)) # Store T_map_cam
+                    else:
+                        all_pnp_results.append(PnPResult(q_idx, q_name, False, num_found_inliers))
+                except Exception as e_pnp:
+                    logging.error(f"Error during PnP for {q_name}: {e_pnp}", exc_info=True)
+                    all_pnp_results.append(PnPResult(q_idx, q_name, False, 0))
+        else:
+            logging.warning("Skipping PnP loop as prerequisites (rendered_views_info or matches_output) are missing.")
+
+
+        successful_pnp_results = [res for res in all_pnp_results if res.success]
+        if not successful_pnp_results:
+            logging.error("PnP failed for ALL images (or prerequisites missing). Cannot proceed with refinement. Will save initial guesses.")
+            # Populate final_delta_t_map with 0s for all query images
+            for q_idx_fail in query_idx_to_name.keys(): final_delta_t_map_seconds[q_idx_fail] = 0.0
+             # Populate final_refined_poses_cam_map with initial render poses (if available)
+            if render_poses_list:
+                for q_idx_fail, q_name_fail in query_idx_to_name.items():
+                    if q_idx_fail < len(render_poses_list) and render_poses_list[q_idx_fail] is not None:
+                        try: final_refined_poses_cam_map[q_name_fail] = np.linalg.inv(render_poses_list[q_idx_fail])
+                        except: pass
+            # Skip to saving results (Step 4)
+        else: # PnP was successful for at least one image
+            logging.info(f"PnP successful for {len(successful_pnp_results)} / {len(query_image_names)} images.")
+
+            # --- 3.6 Hybrid Refinement ---
+            # Use PnP results to get a better initial T_ego_cam for DE
+            pnp_derived_T_ego_cam = get_pnp_derived_initial_T_ego_cam(
+                successful_pnp_results, query_timestamps_rec_us_indexed, 
+                ego_interpolator_us_func, initial_T_ego_cam_guess
+            )
+            
+            # Prepare inlier_matches_map_undistorted_ideal for refinement function
+            # {query_idx: (p2d_UNDISTORTED_ideal_kps, P3d_world)}
+            # These p2d_inliers are from PnP, already in the K_ideal frame.
+            refinement_inlier_matches = {
+                res.query_idx: (res.p2d_inliers, res.P3d_inliers) 
+                for res in successful_pnp_results
+            }
+            refinement_query_indices = [res.query_idx for res in successful_pnp_results]
+            # Filter query_timestamps_rec_us_indexed for only those in refinement_query_indices
+            refinement_query_timestamps_rec_us = {
+                idx: ts for idx, ts in query_timestamps_rec_us_indexed.items() if idx in refinement_query_indices
+            }
+            
+            # Prepare debug visualization parameters for the final LS part of hybrid refinement
+            opt_data_debug_params_for_ls = None
+            if visualize_distortpoints_debug and query_idx_to_name and successful_pnp_results:
+                indices_for_ls_opt_data_vis = [res.query_idx for res in successful_pnp_results[:num_distortpoints_debug_images]]
+                if indices_for_ls_opt_data_vis:
+                    opt_data_debug_params_for_ls = {
+                        'image_idx_to_name_map': query_idx_to_name,
+                        'query_image_dir': query_image_dir, # Original distorted images
+                        'output_vis_dir': vis_base_output_dir / 'hybrid_opt_data_LS_debug',
+                        'vis_image_indices': indices_for_ls_opt_data_vis
+                    }
+                    (vis_base_output_dir / 'hybrid_opt_data_LS_debug').mkdir(parents=True, exist_ok=True)
+
+            if refinement_query_indices:
+                logging.info(f"--- Running Hybrid Refinement on {len(refinement_query_indices)} PnP-successful Images ---")
+                
+                # Define wider xi_offset for Stage 1 DE if desired, or use a new CLI arg
+                stage1_xi_offset_for_de = np.array([0.2, 0.2, 0.2, 0.4, 0.4, 0.4]) # Example wider for DE
+
+                opt_T_ego_cam, opt_K_sensor, opt_D_sensor, opt_delta_t_map_s, _ = refine_parameters_de_extr_then_ls_joint(
+                    initial_T_ego_cam_from_config=initial_T_ego_cam_guess,
+                    pnp_derived_T_ego_cam_guess=pnp_derived_T_ego_cam,
+                    inlier_matches_map_undistorted_ideal=refinement_inlier_matches,
                     ego_timestamps_us=ego_timestamps_us,
                     ego_poses=ego_poses_list,
-                    query_indices=joint_opt_indices, # These are the indices for this specific optimization run
-                    query_timestamps_rec_us=joint_opt_timestamps_rec_us,
-                    initial_K_matrix=camera_intrinsics_matrix,
-                    initial_D_coeffs=camera_distortion_array,
-                    model_type=MODEL_TYPE, # Ensure MODEL_TYPE is correctly defined (e.g. from parsed_data['model_type'])
-                    img_width=image_width,
-                    img_height=image_height,
-                    dt_bounds_seconds=dt_bounds_joint_opt,
-                    loss_function=loss_function,
-                    verbose=opt_verbose,
+                    query_indices_for_opt=refinement_query_indices,
+                    query_timestamps_rec_us=refinement_query_timestamps_rec_us,
+                    K_initial_sensor=camera_intrinsics_matrix_ideal, # Initial K_sensor for LS stage
+                    initial_D_sensor_coeffs=camera_distortion_array_sensor, # Initial D_sensor for LS stage
+                    model_type=camera_model_type,
+                    img_width=image_width, img_height=image_height,
+                    K_ideal_for_undistorted_input_normalization=camera_intrinsics_matrix_ideal,
+                    
+                    stage1_de_xi_bounds_abs_offset=stage1_xi_offset_for_de, # Wider bounds for Stage 1 DE
+                    stage1_de_popsize_factor=de_popsize_factor,
+                    stage1_de_maxiter=de_maxiter,
+                    
+                    de_robust_loss_type=de_robust_loss_type,
+                    de_robust_loss_scale=de_robust_loss_scale,
+                    de_workers=de_workers,
+
+                    final_ls_dt_bounds_seconds=dt_bounds_final_ls,
+                    final_ls_loss_function=loss_function_final_ls,
+                    final_ls_verbose=final_ls_opt_verbose,
+                    # Pass the cfg_intrinsic_bounds from main to constrain LS intrinsics
+                    final_ls_intrinsic_bounds_from_config=intrinsic_bounds_config, # This is `cfg_intrinsic_bounds` from main
+
                     interpolation_tolerance_us=1,
-                    intrinsic_bounds_config=intrinsic_bounds_config,
-                    debug_opt_data_vis_params=opt_data_debug_params_for_refinement # Pass the prepared dict
+                    debug_opt_data_vis_params=opt_data_debug_params_for_ls
                 )
+
                 if opt_T_ego_cam is not None:
-                    refined_T_ego_cam = opt_T_ego_cam # Update the global T_ego_cam
-                    refined_K_matrix = opt_K_matrix # Store refined K
-                    refined_D_coeffs = opt_D_coeffs # Store refined D
-                    # opt_delta_t_map contains dt for PnP-successful images.
-                    # Update final_delta_t_map with these.
-                    for q_idx, dt_val in opt_delta_t_map.items():
-                        if q_idx in joint_opt_indices: # Ensure it was part of this optimization
-                            final_delta_t_map[q_idx] = dt_val
-                    logging.info("Joint refinement successful for PnP-successful images.")
-                    logging.info(f"Refined T_ego_cam:\n{np.round(refined_T_ego_cam, 6)}")
-                    # Log stats for the dts that were actually optimized
-                    optimized_dt_values_from_joint = [dt for idx, dt in final_delta_t_map.items() if idx in joint_opt_indices]
-                    if optimized_dt_values_from_joint:
-                        logging.info(f"Refined Delta_t (seconds) from joint opt (for {len(optimized_dt_values_from_joint)} images): Mean={np.mean(optimized_dt_values_from_joint):.6f}s, Std={np.std(optimized_dt_values_from_joint):.6f}s, Min={np.min(optimized_dt_values_from_joint):.6f}s, Max={np.max(optimized_dt_values_from_joint):.6f}s")
-
-                    # Check optimality from joint_opt_result_obj
-                    if joint_opt_result_obj and joint_opt_result_obj.optimality > 1e-1: # Stricter check for final run
-                        logging.warning(f"Joint optimization finished with high optimality ({joint_opt_result_obj.optimality:.2e}). Results might be suboptimal.")
-
+                    final_refined_T_ego_cam = opt_T_ego_cam
+                    final_refined_K_sensor = opt_K_sensor
+                    final_refined_D_sensor = opt_D_sensor
+                    # opt_delta_t_map_s is for images in refinement_query_indices
+                    for q_idx, dt_val in opt_delta_t_map_s.items():
+                        final_delta_t_map_seconds[q_idx] = dt_val # Update main map
                 else:
-                    logging.error("Joint refinement FAILED. `refined_T_ego_cam` will remain the initial guess, and `dt` for PnP-successful images will effectively be 0 from this stage.")
-                    # In this case, refined_T_ego_cam is still initial_T_ego_cam_guess.
-                    # final_delta_t_map will not be updated for PnP-successful images here,
-                    # they will get 0.0 in the next step.
-                    # Ensure refined_K_matrix and refined_D_coeffs are set to initial if opt failed
-                    refined_K_matrix = camera_intrinsics_matrix
-                    refined_D_coeffs = camera_distortion_array
-            else:
-                logging.warning("No valid images (with timestamps) for joint optimization among PnP-successful ones. `T_ego_cam` remains initial guess.")
-        else:
-            logging.warning("No PnP-successful images. Skipping joint refinement. `T_ego_cam` remains initial guess.")
+                    logging.error("Hybrid refinement FAILED. Using initial guesses for final T_ego_cam, K_sensor, D_sensor.")
+                    # final_refined_T_ego_cam, K_sensor, D_sensor remain initial.
+                    # dt for PnP-successful images will be 0.0 (set in next block).
+            else: # No images for refinement (e.g. all PnP failed)
+                 logging.warning("No images available for hybrid refinement after PnP. Using initial guesses.")
+        
+        # --- 3.7 Post-Refinement: Set dt=0 for PnP-failed images, Calculate Final Poses ---
+        for pnp_res in all_pnp_results: # Iterate all PnP attempts
+            if pnp_res.query_idx not in final_delta_t_map_seconds:
+                # This applies to PnP-failed images, or if refinement itself failed for PnP-successful ones
+                final_delta_t_map_seconds[pnp_res.query_idx] = 0.0
+        
+        # Calculate final poses T_cam_map using final_refined_T_ego_cam and final_delta_t_map_seconds
+        logging.info(f"Calculating Final Poses using refined T_ego_cam, K_sensor, D_sensor and delta_t map...")
+        num_final_poses_calc = 0
+        for q_idx, q_name in query_idx_to_name.items():
+            rec_ts_us = query_timestamps_rec_us_indexed.get(q_idx)
+            delta_t_s = final_delta_t_map_seconds.get(q_idx)
 
-        # --- 3.7 Set dt=0 for PnP-failed images ---
-        # Ensure all images (PnP success or fail) have an entry in final_delta_t_map
-        for pnp_res_orig in all_pnp_results:
-            if pnp_res_orig.query_idx not in final_delta_t_map:
-                # This will assign dt=0 to PnP-failed images,
-                # and also to PnP-successful images if joint opt failed or they were excluded.
-                logging.debug(f"Assigning dt=0 to image {pnp_res_orig.query_name} (idx: {pnp_res_orig.query_idx}).")
-                final_delta_t_map[pnp_res_orig.query_idx] = 0.0
-
-        logging.info(f"Final delta_t map populated for {len(final_delta_t_map)} images (PnP-successful from joint opt, others 0.0).")
-
-        # --- 3.8 Calculate Final Poses ---
-        if refined_T_ego_cam is None: # Should be initial_T_ego_cam_guess if joint opt failed
-             logging.error("`refined_T_ego_cam` is None before final pose calculation, though it should default to initial guess. Critical error. Aborting.")
-             return
-        if not final_delta_t_map and query_idx_to_name : # If we have query images but no dt map (should not happen)
-             logging.error("Final delta_t map is unexpectedly empty. Aborting pose calculation.")
-             return
-
-        logging.info(f"Calculating Final Poses using refined T_ego_cam and delta_t map...")
-        # final_refined_poses_cam_map already initialized
-        num_final_poses = 0; num_calc_errors = 0
-        for query_idx, query_name in query_idx_to_name.items():
-            if query_idx not in final_delta_t_map:
-                 logging.warning(f"Delta_t missing for {query_name} in final map. Skipping pose."); num_calc_errors += 1; continue
-            if query_idx not in query_timestamps_rec_us_indexed:
-                 logging.warning(f"Recorded timestamp missing for {query_name}. Skipping pose."); num_calc_errors += 1; continue
-            rec_ts_us = query_timestamps_rec_us_indexed[query_idx]
-            delta_t_seconds = final_delta_t_map[query_idx]
-            delta_t_us_float = delta_t_seconds * 1_000_000.0
-            true_ts_us_float = float(rec_ts_us) + delta_t_us_float
-            T_map_ego_final = interpolate_ego_pose_for_opt_us(true_ts_us_float)
+            if rec_ts_us is None or delta_t_s is None:
+                logging.warning(f"Missing timestamp or delta_t for {q_name}. Cannot calculate final pose."); continue
+            
+            true_ts_us = float(rec_ts_us) + (delta_t_s * 1_000_000.0)
+            T_map_ego_final = ego_interpolator_us_func(true_ts_us)
             if T_map_ego_final is None:
-                logging.warning(f"Could not interpolate final ego pose for {query_name}."); num_calc_errors += 1; continue
-            T_map_cam_final = T_map_ego_final @ refined_T_ego_cam
-            try: final_refined_poses_cam_map[query_name] = np.linalg.inv(T_map_cam_final)
-            except np.linalg.LinAlgError: logging.warning(f"Could not invert final pose for {query_name}.") # T_cam_map will be missing
-            num_final_poses += 1
-        logging.info(f"Calculated {num_final_poses} final refined poses ({num_calc_errors} errors/skips).")
-        if num_final_poses == 0 and len(query_idx_to_name) > 0 :
-            logging.error("No final poses could be calculated successfully. Check logs.")
-
-        # --- Step 4: Saving Results ---
-        logging.info("--- Running Step 4: Saving Final Results ---")
-        # (Saving logic remains the same as previous response, uses refined_T_ego_cam, final_delta_t_map, final_refined_poses_cam_map)
-        if refined_T_ego_cam is not None:
-            logging.info(f"Saving refined T_ego_cam to {refined_extrinsics_file}")
-            logging.info(f"Refined T_ego_cam value to be saved:\n{np.round(refined_T_ego_cam, 6)}")
+                logging.warning(f"Could not interpolate final ego pose for {q_name}."); continue
+            
+            T_map_cam_final = T_map_ego_final @ final_refined_T_ego_cam # final_refined_T_ego_cam is T_sensor_cam
             try:
-                with open(refined_extrinsics_file, 'w') as f:
-                    f.write("# Refined T_ego_cam (Sensor to Camera Transformation) - Row Major\n")
-                    for row in refined_T_ego_cam: f.write(" ".join(map(str, row)) + "\n")
-                logging.info("Successfully saved refined extrinsics.")
-            except Exception as e: logging.error(f"Failed to save refined extrinsics: {e}", exc_info=True)
-        else: logging.warning("Refined T_ego_cam is None. Cannot save extrinsics.")
+                final_refined_poses_cam_map[q_name] = np.linalg.inv(T_map_cam_final) # Store T_cam_map
+                num_final_poses_calc += 1
+            except np.linalg.LinAlgError:
+                logging.warning(f"Could not invert final pose T_map_cam for {q_name}.")
+        logging.info(f"Calculated {num_final_poses_calc} final refined poses (T_cam_map).")
 
-        if final_delta_t_map:
-            logging.info(f"Saving refined delta_t map ({len(final_delta_t_map)} entries) to {refined_delta_t_file}")
-            all_dt_values_final_map = [dt for dt in final_delta_t_map.values()] # Get all values from final map
-            if all_dt_values_final_map: # Check if list is not empty
-                logging.info(f" -> Final Delta_t Stats (ALL images): Mean={np.mean(all_dt_values_final_map):.6f}s, Std={np.std(all_dt_values_final_map):.6f}s, Min={np.min(all_dt_values_final_map):.6f}s, Max={np.max(all_dt_values_final_map):.6f}s")
-            else: logging.info(" -> Final Delta_t map was populated but values list is empty (should not happen if map not empty).")
+
+        # --- Saving Results & Final Visualizations ---
+        logging.info("--- Running Step 4: Saving Final Results & Visualizations ---")
+        
+        # Save refined T_ego_cam (Sensor to Camera Transformation)
+        logging.info(f"Saving refined T_ego_cam to {refined_extrinsics_file}")
+        logging.info(f"Refined T_ego_cam value:\n{np.round(final_refined_T_ego_cam, 6)}")
+        with open(refined_extrinsics_file, 'w') as f:
+            f.write("# Refined T_ego_cam (Sensor to Camera Transformation) - Row Major\n")
+            for row in final_refined_T_ego_cam: f.write(" ".join(map(str, row)) + "\n")
+
+        # Save refined K_sensor and D_sensor
+        refined_K_file = output_dir / f'refined_intrinsics_K_sensor_{camera_name_in_list}.txt'
+        refined_D_file = output_dir / f'refined_intrinsics_D_sensor_{camera_name_in_list}.txt'
+        logging.info(f"Saving refined K_sensor to {refined_K_file}:\n{np.round(final_refined_K_sensor,4)}")
+        np.savetxt(refined_K_file, final_refined_K_sensor, fmt='%.18e')
+        logging.info(f"Saving refined D_sensor to {refined_D_file}: {np.round(final_refined_D_sensor,6)}")
+        np.savetxt(refined_D_file, final_refined_D_sensor, fmt='%.18e')
+        with open(refined_D_file, 'a') as f: f.write(f"\n# model_type: {camera_model_type}\n")
+
+        # Save refined delta_t map
+        if final_delta_t_map_seconds:
+            # (Saving logic for delta_t - REMAINS THE SAME)
+            logging.info(f"Saving refined delta_t map ({len(final_delta_t_map_seconds)} entries) to {refined_delta_t_file}")
             try:
-                with open(refined_delta_t_file, 'w', newline='') as f:
-                    writer = csv.writer(f); writer.writerow(['image_name', 'delta_t_seconds'])
-                    sorted_indices = sorted(final_delta_t_map.keys(), key=lambda idx: query_idx_to_name.get(idx, str(idx)))
-                    for query_idx in sorted_indices:
-                        writer.writerow([query_idx_to_name.get(query_idx, f"idx_{query_idx}"), f"{final_delta_t_map[query_idx]:.9f}"])
-                logging.info("Successfully saved refined delta_t map.")
-            except Exception as e: logging.error(f"Failed to save delta_t map: {e}", exc_info=True)
+                with open(refined_delta_t_file, 'w', newline='') as f_dt:
+                    writer_dt = csv.writer(f_dt); writer_dt.writerow(['image_name', 'delta_t_seconds'])
+                    sorted_indices_dt = sorted(final_delta_t_map_seconds.keys(), key=lambda idx_dt: query_idx_to_name.get(idx_dt, str(idx_dt)))
+                    for q_idx_dt in sorted_indices_dt:
+                        writer_dt.writerow([query_idx_to_name.get(q_idx_dt, f"idx_{q_idx_dt}"), f"{final_delta_t_map_seconds[q_idx_dt]:.9f}"])
+            except Exception as e_dt_save: logging.error(f"Failed to save delta_t map: {e_dt_save}", exc_info=True)
         else: logging.warning("Final delta_t map is empty. Cannot save delta_t CSV.")
 
-        # Add saving for refined K and D
-        refined_K_file = output_dir / f'refined_intrinsics_K_{camera_name_in_list}.txt'
-        refined_D_file = output_dir / f'refined_intrinsics_D_{camera_name_in_list}.txt'
-        
-        if 'refined_K_matrix' in locals() and refined_K_matrix is not None:
-            logging.info(f"Saving refined K_matrix to {refined_K_file}")
-            try:
-                np.savetxt(refined_K_file, refined_K_matrix, fmt='%.18e')
-                logging.info("Successfully saved refined K_matrix.")
-            except Exception as e:
-                logging.error(f"Failed to save refined K_matrix: {e}", exc_info=True)
-        else:
-            logging.warning("Refined K_matrix not available. Cannot save.")
-
-        if 'refined_D_coeffs' in locals() and refined_D_coeffs is not None:
-            logging.info(f"Saving refined D_coeffs to {refined_D_file}")
-            try:
-                np.savetxt(refined_D_file, refined_D_coeffs, fmt='%.18e') # Save as a row
-                with open(refined_D_file, 'a') as f: # Append model type for clarity
-                    f.write(f"\n# model_type: {MODEL_TYPE}\n")
-                    f.write(f"# D_coeffs length: {len(refined_D_coeffs)}\n")
-                logging.info("Successfully saved refined D_coeffs.")
-            except Exception as e:
-                logging.error(f"Failed to save refined D_coeffs: {e}", exc_info=True)
-        else:
-            logging.warning("Refined D_coeffs not available. Cannot save.")
-
+        # Save final refined poses (T_cam_map)
         logging.info(f"Saving {len(final_refined_poses_cam_map)} final refined poses (T_cam_map) to {refined_poses_file}")
-        if final_refined_poses_cam_map: save_poses_to_colmap_format(final_refined_poses_cam_map, refined_poses_file)
+        if final_refined_poses_cam_map:
+            save_poses_to_colmap_format(final_refined_poses_cam_map, refined_poses_file)
         else: logging.warning("No refined poses (T_cam_map) to save.")
 
-        # --- Final Visualizations (Optional) ---
-        if visualize_steps and final_refined_poses_cam_map:
+        # Final Visualizations (Map Projection using final_refined_K_sensor, D_sensor, T_cam_map)
+        if visualize_steps and final_refined_poses_cam_map and processed_lidar_data_loaded:
+            # (Visualization logic - REMAINS THE SAME, but uses final_refined_K_sensor and final_refined_D_sensor)
             logging.info(f"Generating Final Map Projection Visualizations ({num_images_to_visualize} images)...")
-            current_K_for_vis = refined_K_matrix if 'refined_K_matrix' in locals() and refined_K_matrix is not None else camera_intrinsics_matrix
-            current_D_for_vis = refined_D_coeffs if 'refined_D_coeffs' in locals() and refined_D_coeffs is not None else camera_distortion_array
-            # (Same visualization logic as before)
             vis_count = 0
-            sorted_query_names = sorted(final_refined_poses_cam_map.keys())
-            for query_name in sorted_query_names:
+            sorted_final_q_names = sorted(final_refined_poses_cam_map.keys())
+            for q_name_final_vis in sorted_final_q_names:
                  if vis_count >= num_images_to_visualize: break
-                 T_cam_map_final = final_refined_poses_cam_map.get(query_name)
-                 if T_cam_map_final is None: continue # Should not happen if key exists, but safe check
-                 img_path_original = query_image_dir / query_name # Path to original distorted image
-                 if not img_path_original.exists(): continue
-                 vis_proj_path = vis_pnp_output_dir / f"{Path(query_name).stem}_{camera_name_in_list}_refined.jpg"
-                 try:
-                     visualize_map_projection(
-                         original_image_path=str(img_path_original),
-                         processed_lidar_data=processed_lidar_data_loaded,
-                         camera_intrinsics_K=current_K_for_vis, # Refined or initial K
-                         camera_distortion_D=current_D_for_vis,  # Refined or initial D
-                         model_type=MODEL_TYPE,
-                         pose_cam_from_map=T_cam_map_final,
-                         output_path=str(vis_proj_path),
-                         point_size=int(visualize_map_point_size),
-                         max_vis_points=500000, # Or from args
-                         filter_distance=50.0 # Or from args, example value
-                     )
-                     vis_count += 1
-                 except Exception as e_vis: logging.error(f"Error visualizing final projection for {query_name}: {e_vis}", exc_info=True)
-            logging.info(f"Finished generating {vis_count} final visualizations.")
+                 T_cam_map_final_vis = final_refined_poses_cam_map.get(q_name_final_vis)
+                 if T_cam_map_final_vis is None: continue
+                 
+                 img_path_original_distorted_vis = query_image_dir / q_name_final_vis
+                 if not img_path_original_distorted_vis.exists(): continue
+                 
+                 vis_proj_path_final = vis_pnp_output_dir / f"{Path(q_name_final_vis).stem}_{camera_name_in_list}_refined_map_proj.jpg"
+                 visualize_map_projection(
+                     str(img_path_original_distorted_vis), processed_lidar_data_loaded,
+                     final_refined_K_sensor, final_refined_D_sensor,
+                     camera_model_type, T_cam_map_final_vis, str(vis_proj_path_final),
+                     point_size=int(visualize_map_point_size), filter_distance=50.0
+                 )
+                 vis_count+=1
+            logging.info(f"Finished generating {vis_count} final map projection visualizations.")
         elif visualize_steps:
-            logging.warning("Skipping final visualizations because no refined poses were available.")
+            logging.warning("Skipping final visualizations due to missing refined poses or LiDAR data.")
 
-    logging.info("Pipeline execution finished.")
+    logging.info(f"Pipeline execution finished for camera {camera_name_in_list}.")
 
 # ==============================================
 # Example Main Block to Run the Pipeline
 # ==============================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Camera extrinsic and time offset refinement pipeline with staged optimization.')
+    parser = argparse.ArgumentParser(description='Hybrid camera extrinsic and time offset refinement pipeline.')
     parser.add_argument('-s', '--steps', nargs='*', type=int, default=None, help='List of steps to run (e.g., 1 2 3)')
-    parser.add_argument('-c', '--camera_name', type=str, default=None, help='Camera name to be processed.')
-    # Add argument for controlling the number of images in joint optimization
-    parser.add_argument('--num_joint_opt', type=int, default=20, help='Number of top images (by inliers) to use for joint extrinsic/time optimization.')
+    parser.add_argument('-c', '--camera_name', type=str, default=None, required=True, help='Camera name to be processed (must match a name in cameras.cfg).')
+    # DE specific parameters
+    parser.add_argument('--de_popsize_factor', type=int, default=15, help='Differential Evolution popsize factor (popsize = factor * num_params).')
+    parser.add_argument('--de_maxiter', type=int, default=150, help='Differential Evolution maximum iterations.')
+    parser.add_argument('--de_workers', type=int, default=-1, help='Differential Evolution workers (-1 for all cores).')
+    # Add other general args if needed (e.g., paths, already handled by fixed vars below)
     args = parser.parse_args()
 
-    # --- Configuration ---
-    # Make sure the LiDAR map has intensity if you want to use highlighting
-    CAMERA_NAME = args.camera_name
-    INPUT_PATH = Path("input_tmp")
+    # --- Configuration (mostly fixed paths for this example) ---
+    CAMERA_NAME_ARG = args.camera_name # From command line
+    INPUT_PATH = Path("input_tmp") # Example base input path
     LIDAR_MAP_PATH = INPUT_PATH / "whole_map.pcd"
-    QUERY_IMG_DIR = INPUT_PATH / CAMERA_NAME 
-    QUERY_IMG_LIST = INPUT_PATH / ("query_image_list_" + CAMERA_NAME + ".txt") # Text file, one image name per line (e.g., frame_00101.png)
-    OUTPUT_DIR = Path("output")
-    INIT_POSE_PATH = INPUT_PATH / "null_0_0_0_local2global_cam_pose.csv"
+    QUERY_IMG_DIR_BASE = INPUT_PATH # Query images are in INPUT_PATH / CAMERA_NAME_ARG
+    QUERY_IMG_LIST_TPL = INPUT_PATH / "query_image_list_{camera_name}.txt"
+    OUTPUT_DIR_BASE = Path("output_hybrid") # New output directory for hybrid results
+    
+    # Initial poses for rendering (T_map_cam)
+    INIT_POSE_CSV_PATH = INPUT_PATH / "null_0_0_0_local2global_cam_pose.csv" # CSV for T_map_cam
+    # Ego vehicle poses (T_map_ego)
     EGO_POSE_CSV_PATH = INPUT_PATH / "null_0_0_0_local2global_pose.csv"
+    # Camera configuration file
+    CAM_CONFIG_FILE_PATH = INPUT_PATH / "cameras.cfg"
 
-    cam_config_file_path = INPUT_PATH / "cameras.cfg"
-
+    # --- Parse Camera Configuration ---
     try:
-        with open(cam_config_file_path, "r") as f:
-            config_text = f.read()
-        logging.info(f"Read config file {cam_config_file_path}")
-    except FileNotFoundError:
-        logging.error(f"Error: Config file {cam_config_file_path} not found!")
-        exit(1)
-    except Exception as e:
-         logging.error(f"Error reading config file {cam_config_file_path}: {e}")
-         exit(1)
-
-    # Use your parser
+        with open(CAM_CONFIG_FILE_PATH, "r") as f_cfg: config_text = f_cfg.read()
+    except FileNotFoundError: logging.error(f"Camera config file {CAM_CONFIG_FILE_PATH} not found!"); exit(1)
+    
     all_parsed_configs = parse_camera_configs(config_text)
-    if not all_parsed_configs:
-        logging.error("Failed to parse any configurations from the file.")
-        exit(1)
+    if not all_parsed_configs: logging.error("Failed to parse camera configurations."); exit(1)
 
-    # --- Extract Parameters for the Target Camera ---
-    logging.info(f"Extracting parameters for camera '{CAMERA_NAME}'...")
-    # Use the new wrapper function
-    parsed_data = get_camera_params_from_parsed(all_parsed_configs, CAMERA_NAME)
+    cam_params = get_camera_params_from_parsed(all_parsed_configs, CAMERA_NAME_ARG)
+    if not cam_params: logging.error(f"Could not get parameters for camera {CAMERA_NAME_ARG}."); exit(1)
 
-    if parsed_data:
-        # Now you can assign these values to your pipeline variables
-        INITIAL_T_EGO_CAM_GUESS = parsed_data['T_ego_cam']
-        assert INITIAL_T_EGO_CAM_GUESS.shape == (4,4), "Initial T_ego_cam guess must be a 4x4 matrix."
-        IMG_W = parsed_data['img_width']
-        IMG_H = parsed_data['img_height']
-        K_MATRIX = parsed_data['K']
-        D_FISHEYE = parsed_data['D']
-        MODEL_TYPE = parsed_data['model_type']
+    # Assign parsed parameters
+    # T_sensor_cam (or T_ego_cam if sensor frame = ego frame)
+    # This is the initial guess for the extrinsic transformation
+    # For the pipeline, it's called initial_T_ego_cam_guess
+    pipeline_initial_T_ego_cam = cam_params['T_ego_cam']
+    pipeline_img_w = cam_params['img_width']
+    pipeline_img_h = cam_params['img_height']
+    # K_ideal: The K matrix for the ideal, undistorted camera model.
+    # We assume the parsed 'K' from config is this K_ideal.
+    pipeline_K_ideal = cam_params['K']
+    # D_sensor: The distortion parameters of the physical sensor.
+    pipeline_D_sensor = cam_params['D']
+    pipeline_model_type = cam_params['model_type']
 
-        print("\n--- Parsed Values ---")
-        print(f"Camera Model: {MODEL_TYPE}")
-        print(f"IMG_W: {IMG_W}, IMG_H: {IMG_H}")
-        print(f"K_MATRIX:\n{K_MATRIX}")
-        print(f"D_FISHEYE:\n{D_FISHEYE}")
-        print(f"INITIAL_T_EGO_CAM_GUESS (T_sensor_cam):\n{INITIAL_T_EGO_CAM_GUESS}")
+    print("\n--- Parsed Values ---")
+    print(f"Camera Model: {pipeline_model_type}")
+    print(f"IMG_W: {pipeline_img_w}, IMG_H: {pipeline_img_h}")
+    print(f"K_MATRIX:\n{pipeline_K_ideal}")
+    print(f"D_FISHEYE:\n{pipeline_D_sensor}")
+    print(f"INITIAL_T_EGO_CAM_GUESS (T_sensor_cam):\n{pipeline_initial_T_ego_cam}")
 
-        RENDER_POSES = get_init_poses(INIT_POSE_PATH, CAMERA_NAME, QUERY_IMG_LIST)
+    # --- Prepare query image list path ---
+    current_query_img_list_path = Path(str(QUERY_IMG_LIST_TPL).format(camera_name=CAMERA_NAME_ARG))
+    current_query_img_dir = QUERY_IMG_DIR_BASE / CAMERA_NAME_ARG
+    current_output_dir = OUTPUT_DIR_BASE / CAMERA_NAME_ARG
 
-        # --- Check files/folders ---
-        if not LIDAR_MAP_PATH.exists(): raise FileNotFoundError(f"LiDAR map not found: {LIDAR_MAP_PATH}")
-        if not QUERY_IMG_DIR.is_dir(): raise NotADirectoryError(f"Query image directory not found: {QUERY_IMG_DIR}")
-        if not QUERY_IMG_LIST.exists(): raise FileNotFoundError(f"Query image list not found: {QUERY_IMG_LIST}")
-        if not EGO_POSE_CSV_PATH.exists(): raise FileNotFoundError(f"Ego pose CSV not found: {EGO_POSE_CSV_PATH}")
+    # --- Get Initial Poses for Rendering (T_map_cam) ---
+    # These are often ground truth or from another localization system
+    initial_render_poses_map_cam = get_init_poses(INIT_POSE_CSV_PATH, CAMERA_NAME_ARG, current_query_img_list_path)
+    if not initial_render_poses_map_cam:
+        logging.warning(f"No initial render poses found for {CAMERA_NAME_ARG}. Rendering step will be skipped if it relies on this.")
+        initial_render_poses_map_cam = [] # Ensure it's a list
 
-        if MODEL_TYPE == "KANNALA_BRANDT":
-            num_d_params_expected = 4
-            if D_FISHEYE is not None and len(D_FISHEYE.flatten()) == num_d_params_expected:
-                d_initial_flat = D_FISHEYE.flatten()
-                intrinsic_bounds_config_kb = {
-                    'k_low': [ # fx, fy, cx, cy
-                        K_MATRIX[0, 0] * 0.9,  # fx_min (e.g., 10% deviation)
-                        K_MATRIX[1, 1] * 0.9,  # fy_min
-                        K_MATRIX[0, 2] - 0.1 * IMG_W,  # cx_min (e.g., 10% of width)
-                        K_MATRIX[1, 2] - 0.1 * IMG_H,  # cy_min (e.g., 10% of height)
-                    ],
-                    'k_high': [
-                        K_MATRIX[0, 0] * 1.1,  # fx_max
-                        K_MATRIX[1, 1] * 1.1,  # fy_max
-                        K_MATRIX[0, 2] + 0.1 * IMG_W,  # cx_max
-                        K_MATRIX[1, 2] + 0.1 * IMG_H,  # cy_max
-                    ],
-                    'd_low': [ # k1, k2, k3, k4
-                        d_initial_flat[0] - 0.05 if abs(d_initial_flat[0]) < 0.3 else d_initial_flat[0] * 0.7 if d_initial_flat[0] > 0 else d_initial_flat[0] * 1.3,
-                        d_initial_flat[1] - 0.03 if abs(d_initial_flat[1]) < 0.1 else d_initial_flat[1] * 0.7 if d_initial_flat[1] > 0 else d_initial_flat[1] * 1.3,
-                        d_initial_flat[2] - 0.01 if abs(d_initial_flat[2]) < 0.05 else d_initial_flat[2] * 0.5 if d_initial_flat[2] > 0 else d_initial_flat[2] * 1.5,
-                        d_initial_flat[3] - 0.01 if abs(d_initial_flat[3]) < 0.05 else d_initial_flat[3] * 0.5 if d_initial_flat[3] > 0 else d_initial_flat[3] * 1.5,
-                    ],
-                    'd_high': [
-                        d_initial_flat[0] + 0.05 if abs(d_initial_flat[0]) < 0.3 else d_initial_flat[0] * 1.3 if d_initial_flat[0] > 0 else d_initial_flat[0] * 0.7,
-                        d_initial_flat[1] + 0.03 if abs(d_initial_flat[1]) < 0.1 else d_initial_flat[1] * 1.3 if d_initial_flat[1] > 0 else d_initial_flat[1] * 0.7,
-                        d_initial_flat[2] + 0.01 if abs(d_initial_flat[2]) < 0.05 else d_initial_flat[2] * 1.5 if d_initial_flat[2] > 0 else d_initial_flat[2] * 0.5,
-                        d_initial_flat[3] + 0.01 if abs(d_initial_flat[3]) < 0.05 else d_initial_flat[3] * 1.5 if d_initial_flat[3] > 0 else d_initial_flat[3] * 0.5,
-                    ]
-                }
-                # Ensure d_low is less than d_high
-                for i in range(num_d_params_expected):
-                    if intrinsic_bounds_config_kb['d_low'][i] >= intrinsic_bounds_config_kb['d_high'][i]:
-                        mid_val = (intrinsic_bounds_config_kb['d_low'][i] + intrinsic_bounds_config_kb['d_high'][i]) / 2
-                        intrinsic_bounds_config_kb['d_low'][i] = mid_val - 0.001 # small epsilon
-                        intrinsic_bounds_config_kb['d_high'][i] = mid_val + 0.001
-                current_intrinsic_bounds_config = intrinsic_bounds_config_kb
-            else:
-                logging.warning(f"KANNALA_BRANDT D_FISHEYE initial is None or wrong length. Using default wide D bounds for opt.")
-                current_intrinsic_bounds_config = None # Fallback to defaults in refine_all_parameters
+    # --- File/Directory Checks ---
+    if not LIDAR_MAP_PATH.exists(): raise FileNotFoundError(f"LiDAR map not found: {LIDAR_MAP_PATH}")
+    if not current_query_img_dir.is_dir(): raise NotADirectoryError(f"Query image directory not found: {current_query_img_dir}")
+    if not current_query_img_list_path.exists(): raise FileNotFoundError(f"Query image list not found: {current_query_img_list_path}")
+    if not EGO_POSE_CSV_PATH.exists(): raise FileNotFoundError(f"Ego pose CSV not found: {EGO_POSE_CSV_PATH}")
+    if not INIT_POSE_CSV_PATH.exists(): logging.warning(f"Initial pose CSV for rendering not found: {INIT_POSE_CSV_PATH}")
 
-        elif MODEL_TYPE == "PINHOLE":
-            # Assuming D_FISHEYE for pinhole is [k1, k2, p1, p2, k3] (5 params)
-            num_d_params_expected = 4 # Adjust if you optimize a different number (e.g., 4 or 8)
-            if D_FISHEYE is not None and len(D_FISHEYE.flatten()) == num_d_params_expected:
-                d_initial_flat = D_FISHEYE.flatten()
-                intrinsic_bounds_config_pinhole = {
-                    'k_low': [ K_MATRIX[0, 0] * 0.9, K_MATRIX[1, 1] * 0.9, K_MATRIX[0, 2] - 0.1 * IMG_W, K_MATRIX[1, 2] - 0.1 * IMG_H, ],
-                    'k_high': [ K_MATRIX[0, 0] * 1.1, K_MATRIX[1, 1] * 1.1, K_MATRIX[0, 2] + 0.1 * IMG_W, K_MATRIX[1, 2] + 0.1 * IMG_H, ],
-                    'd_low': [ # k1, k2, p1, p2
-                        d_initial_flat[0] - 0.1 if abs(d_initial_flat[0]) < 0.5 else d_initial_flat[0] * 0.5 if d_initial_flat[0] > 0 else d_initial_flat[0] * 1.5, # k1
-                        d_initial_flat[1] - 0.1 if abs(d_initial_flat[1]) < 0.5 else d_initial_flat[1] * 0.5 if d_initial_flat[1] > 0 else d_initial_flat[1] * 1.5, # k2
-                        d_initial_flat[2] - 0.001, # p1
-                        d_initial_flat[3] - 0.001, # p2
-                    ],
-                    'd_high': [
-                        d_initial_flat[0] + 0.1 if abs(d_initial_flat[0]) < 0.5 else d_initial_flat[0] * 1.5 if d_initial_flat[0] > 0 else d_initial_flat[0] * 0.5,
-                        d_initial_flat[1] + 0.1 if abs(d_initial_flat[1]) < 0.5 else d_initial_flat[1] * 1.5 if d_initial_flat[1] > 0 else d_initial_flat[1] * 0.5,
-                        d_initial_flat[2] + 0.001,
-                        d_initial_flat[3] + 0.001,
-                    ]
-                }
-                # Ensure d_low is less than d_high
-                for i in range(num_d_params_expected):
-                    if intrinsic_bounds_config_pinhole['d_low'][i] >= intrinsic_bounds_config_pinhole['d_high'][i]:
-                        mid_val = (intrinsic_bounds_config_pinhole['d_low'][i] + intrinsic_bounds_config_pinhole['d_high'][i]) / 2
-                        intrinsic_bounds_config_pinhole['d_low'][i] = mid_val - 0.0001 # small epsilon
-                        intrinsic_bounds_config_pinhole['d_high'][i] = mid_val + 0.0001
-                current_intrinsic_bounds_config = intrinsic_bounds_config_pinhole
-            else:
-                logging.warning(f"PINHOLE D_FISHEYE initial is None or wrong length (expected {num_d_params_expected}). Using default wide D bounds for opt.")
-                current_intrinsic_bounds_config = None # Fallback to defaults
-        else:
-            current_intrinsic_bounds_config = None # No specific bounds for other models yet
 
-        reso_ratio = float(IMG_W)/1920.0
-        render_point_size = 4 * reso_ratio
-        distance_threshold_px = int(30 * reso_ratio)
-        pnp_reprojection_error = int(6 * reso_ratio)
-        visualize_map_point_size = 1.0 * reso_ratio
+    # --- Define Intrinsic Bounds Configuration (example) ---
+    # This should be adapted based on expected model_type and D_sensor length
+    cfg_intrinsic_bounds = None
+    d_initial_flat_sensor = pipeline_D_sensor.flatten() if pipeline_D_sensor is not None else np.array([])
+    num_d_params_sensor = len(d_initial_flat_sensor)
 
-        # --- Run ---
-        run_pipeline(
-            arg_config=args,
-            lidar_map_file=LIDAR_MAP_PATH,
-            query_image_dir=QUERY_IMG_DIR,
-            query_image_list_file=QUERY_IMG_LIST,
-            output_dir=OUTPUT_DIR,
-            render_poses_list=RENDER_POSES,
-            ego_pose_file=EGO_POSE_CSV_PATH,
-            initial_T_ego_cam_guess=INITIAL_T_EGO_CAM_GUESS,
-            camera_intrinsics_matrix=K_MATRIX,
-            camera_distortion_array=D_FISHEYE,
-            image_width=IMG_W, image_height=IMG_H,
-            camera_name_in_list=CAMERA_NAME,
-            # Optional params:
-            voxel_size=0.03, # Adjust voxel size as needed
-            min_height=-2.0, # Filter ground points more aggressively if needed
-            device="auto", # Use "CUDA:0" or "CPU:0" to force
-            render_shading_mode='normal', # 'checkerboard' or 'normal'
-            render_point_size=render_point_size, # Tune this based on point density and resolution! Smaller for dense clouds.
-            intensity_highlight_threshold=0.1, # Example: Highlight points with intensity > 0.8
-            feature_conf='superpoint_aachen', # Or 'superpoint_max', 'superpoint_inloc', etc.
-            matcher_conf='superpoint+lightglue', # Or 'NN-superpoint' (if descriptors match), 'superglue-fast'
-            distance_threshold_px=distance_threshold_px,
-            pnp_min_inliers=5, # Increase if needed
-            pnp_reprojection_error=pnp_reprojection_error, # Maybe tighten this
-            pnp_iterations=500,
-            pnp_confidence=0.999999,
-            dt_bounds_joint_opt=(-0.05, 0.05),
-            loss_function='cauchy',
-            visualize_steps=False,
-            num_images_to_visualize=len(RENDER_POSES),
-            visualize_map_point_size=visualize_map_point_size,
-            opt_verbose=0,
-            intrinsic_bounds_config=current_intrinsic_bounds_config,
-            visualize_distortpoints_debug=True, # Enable the new debug
-            num_distortpoints_debug_images=2,     # Visualize for 2 images, for example
-        )
+    # Example bounds (these are used by both DE and final LS, DE might need wider ones)
+    # The refine_all_parameters_hybrid function has its own logic for DE bounds based on these
+    # and for LS bounds.
+    if pipeline_model_type == "KANNALA_BRANDT" and num_d_params_sensor >= 4:
+        cfg_intrinsic_bounds = {
+            'k_low': [ pipeline_K_ideal[0,0]*0.85, pipeline_K_ideal[1,1]*0.85, pipeline_K_ideal[0,2]-0.12*pipeline_img_w, pipeline_K_ideal[1,2]-0.12*pipeline_img_h ],
+            'k_high': [ pipeline_K_ideal[0,0]*1.15, pipeline_K_ideal[1,1]*1.15, pipeline_K_ideal[0,2]+0.12*pipeline_img_w, pipeline_K_ideal[1,2]+0.12*pipeline_img_h ],
+            'd_low': list(d_initial_flat_sensor[:4] - np.array([0.08, 0.04, 0.015, 0.015])),
+            'd_high': list(d_initial_flat_sensor[:4] + np.array([0.08, 0.04, 0.015, 0.015]))
+        }
+    elif pipeline_model_type == "PINHOLE": # Example for Pinhole k1,k2,p1,p2
+        if num_d_params_sensor >= 4: # Adjust if optimizing more/less Pinhole D params
+            cfg_intrinsic_bounds = {
+                'k_low': [ pipeline_K_ideal[0,0]*0.85, pipeline_K_ideal[1,1]*0.85, pipeline_K_ideal[0,2]-0.12*pipeline_img_w, pipeline_K_ideal[1,2]-0.12*pipeline_img_h ],
+                'k_high': [ pipeline_K_ideal[0,0]*1.15, pipeline_K_ideal[1,1]*1.15, pipeline_K_ideal[0,2]+0.12*pipeline_img_w, pipeline_K_ideal[1,2]+0.12*pipeline_img_h ],
+                'd_low': list(d_initial_flat_sensor[:4] - np.array([0.15, 0.08, 0.003, 0.003])), # k1,k2,p1,p2
+                'd_high': list(d_initial_flat_sensor[:4] + np.array([0.15, 0.08, 0.003, 0.003]))
+            }
+        # Add more elif for other D param counts for Pinhole if needed
 
-    else:
-        print(f"Could not parse configuration for {CAMERA_NAME}.")
+    if cfg_intrinsic_bounds: # Ensure d_low < d_high for safety
+        for i in range(len(cfg_intrinsic_bounds['d_low'])):
+            if cfg_intrinsic_bounds['d_low'][i] >= cfg_intrinsic_bounds['d_high'][i]:
+                mid_d = (cfg_intrinsic_bounds['d_low'][i] + cfg_intrinsic_bounds['d_high'][i]) / 2.0
+                cfg_intrinsic_bounds['d_low'][i] = mid_d - 0.001
+                cfg_intrinsic_bounds['d_high'][i] = mid_d + 0.001
+    
+    # Dynamic point sizes and thresholds based on image resolution (example)
+    reso_ratio = float(pipeline_img_w) / 1920.0 # Assuming 1920px width is baseline
+    dynamic_render_point_size = max(1.0, 4.0 * reso_ratio)
+    dynamic_dist_thresh_px = max(5.0, 30.0 * reso_ratio)
+    dynamic_pnp_reproj_err = max(2.0, 6.0 * reso_ratio)
+    dynamic_vis_map_pt_size = max(1.0, 1.0 * reso_ratio)
+
+
+    # --- Run Pipeline ---
+    run_pipeline(
+        arg_config=args, # Pass parsed args (contains steps, camera_name, de_*)
+        lidar_map_file=LIDAR_MAP_PATH,
+        query_image_dir=current_query_img_dir,
+        query_image_list_file=current_query_img_list_path,
+        output_dir=current_output_dir,
+        render_poses_list=initial_render_poses_map_cam, # T_map_cam for rendering
+        ego_pose_file=EGO_POSE_CSV_PATH,
+        initial_T_ego_cam_guess=pipeline_initial_T_ego_cam, # T_sensor_cam
+        camera_intrinsics_matrix_ideal=pipeline_K_ideal,   # K_ideal
+        camera_distortion_array_sensor=pipeline_D_sensor, # D_sensor
+        image_width=pipeline_img_w, image_height=pipeline_img_h,
+        camera_model_type=pipeline_model_type, # Pass model_type
+        camera_name_in_list=CAMERA_NAME_ARG,
+        # Optional params:
+        voxel_size=0.03, min_height=-2.0, device="auto",
+        render_shading_mode='normal', render_point_size=dynamic_render_point_size, intensity_highlight_threshold=0.1,
+        feature_conf='superpoint_aachen', matcher_conf='superpoint+lightglue', # matcher_conf not directly used by dist match
+        distance_threshold_px=dynamic_dist_thresh_px,
+        pnp_min_inliers=5, pnp_reprojection_error=dynamic_pnp_reproj_err, pnp_iterations=500, pnp_confidence=0.999999,
+        dt_bounds_de_inner_opt=(-0.03, 0.03), # For DE inner loop dt opt
+        dt_bounds_final_ls=(-0.06, 0.06),     # For final LS dt opt
+        final_ls_opt_verbose=1, # Verbosity for final LS
+        de_robust_loss_type='cauchy', # Or 'huber', 'linear'
+        de_robust_loss_scale=dynamic_pnp_reproj_err, # Example: use PnP reproj error as scale (adjust as needed)
+        loss_function_final_ls='cauchy',
+        visualize_steps=True, num_images_to_visualize=(len(initial_render_poses_map_cam) if initial_render_poses_map_cam else 1),
+        visualize_map_point_size=dynamic_vis_map_pt_size,
+        intrinsic_bounds_config=cfg_intrinsic_bounds,
+        visualize_distortpoints_debug=True, # Enable debug for generate_target_distorted_points
+        num_distortpoints_debug_images=2,
+        de_popsize_factor=args.de_popsize_factor, # From argparse
+        de_maxiter=args.de_maxiter,             # From argparse
+        de_workers=args.de_workers              # From argparse
+    )
 

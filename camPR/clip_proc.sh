@@ -2,11 +2,11 @@
 
 INPUT_DIR="input_tmp"
 CAM_CONFIG_FILE="cameras.cfg"
-EGO_POSE_FILE="lio_prior_sensor_coord.txt"
 EGO_POSE_CSV="null_0_0_0_local2global_pose.csv"
 CAM_POSE_FILE="null_0_0_0_local2global_cam_pose.csv"
+MAIN_SCRIPT="main_SOPR.py"
 
-python3 gwm_init_cam_poses.py -c ${INPUT_DIR}/${CAM_CONFIG_FILE} -p ${INPUT_DIR}/${EGO_POSE_FILE} -e ${INPUT_DIR}/${EGO_POSE_CSV} -o ${INPUT_DIR}/${CAM_POSE_FILE}
+python3 gwm_init_cam_poses.py -c ${INPUT_DIR}/${CAM_CONFIG_FILE} -p ${INPUT_DIR}/${EGO_POSE_CSV} -o ${INPUT_DIR}/${CAM_POSE_FILE}
 
 # List of camera names
 CAM_NAMES=("camera_1" "camera_4" "panoramic_1" "panoramic_2" "panoramic_3" "panoramic_4")
@@ -55,7 +55,7 @@ done
 
 
 
-# CAM_NAMES=("panoramic_2")
+# CAM_NAMES=("panoramic_4")
 
 export PYTHONPATH=../
 
@@ -68,21 +68,21 @@ for CAMERA_NAME in "${CAM_NAMES[@]}"; do
   echo "Processing CAMERA: ${CAMERA_NAME}"
   camera_start_time=$(date +%s%N)
 
-  python3 main_SOPR.py -c "${CAMERA_NAME}" -s 1
+  python3 ${MAIN_SCRIPT} -c "${CAMERA_NAME}" -s 1
   if [ $? -ne 0 ]; then
-    echo "  ERROR: main_SOPR.py -s 1 failed for ${CAMERA_NAME}. Continuing with next step/camera."
+    echo "  ERROR: ${MAIN_SCRIPT} -s 1 failed for ${CAMERA_NAME}. Continuing with next step/camera."
     continue
   fi
 
-  python3 main_SOPR.py -c "${CAMERA_NAME}" -s 2
+  python3 ${MAIN_SCRIPT} -c "${CAMERA_NAME}" -s 2
   if [ $? -ne 0 ]; then
-    echo "  ERROR: main_SOPR.py -s 2 failed for ${CAMERA_NAME}. Continuing with next step/camera."
+    echo "  ERROR: ${MAIN_SCRIPT} -s 2 failed for ${CAMERA_NAME}. Continuing with next step/camera."
     continue
   fi
 
-  python3 main_SOPR.py -c "${CAMERA_NAME}" -s 3
+  python3 ${MAIN_SCRIPT} -c "${CAMERA_NAME}" -s 3
   if [ $? -ne 0 ]; then
-    echo "  ERROR: main_SOPR.py -s 3 failed for ${CAMERA_NAME}. Continuing with next step/camera."
+    echo "  ERROR: ${MAIN_SCRIPT} -s 3 failed for ${CAMERA_NAME}. Continuing with next step/camera."
     continue
   fi
 
