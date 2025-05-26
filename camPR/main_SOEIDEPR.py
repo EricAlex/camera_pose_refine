@@ -2526,139 +2526,103 @@ def generate_target_distorted_points(
     return p2d_target_dist_pixels_out
 
 class OptimizationData:
-    def __init__(self, # Changed from 'init' to '__init__'
+    def __init__(self,
                  inlier_matches_map_us: dict,
                  ego_interpolator_us,
-                 K_initial_ideal: np.ndarray,
-                 D_initial_sensor: np.ndarray,
+                 K_initial_ideal_for_opt_data_targets: np.ndarray, # K_sensor for target generation inside THIS OptData
+                 D_initial_sensor_for_opt_data_targets: np.ndarray, # D_sensor for target generation inside THIS OptData
                  model_type: str,
                  img_width: int,
                  img_height: int,
                  t_rec_map_us: dict,
                  num_images_passed_to_constructor: int,
-                 # --- DEBUG VISUALIZATION PARAMETERS ---
+                 # This K_ideal is the one defining the plane of the input p2d_undistorted_pixels.
+                 # It's fixed globally for the normalization step within generate_target_distorted_points.
+                 K_GLOBAL_IDEAL_FOR_UNDIST_NORMALIZATION: np.ndarray,
+                 # Debug parameters
                  debug_image_idx_to_name_map: dict = None,
                  debug_query_image_dir: Path = None,
                  debug_output_vis_dir: Path = None,
-                 debug_vis_image_indices: list = None): # List of specific original_img_idx to visualize
+                 debug_vis_image_indices: list = None):
 
         self.inlier_matches_orig_undist = inlier_matches_map_us
         self.ego_interpolator = ego_interpolator_us
-        self.K_initial_ideal = K_initial_ideal.astype(np.float64)
-        self.D_initial_sensor = D_initial_sensor.copy() if D_initial_sensor is not None else None
+        
+        # K and D used by THIS OptData instance to generate its internal target points.
+        # For final LS, these would be K_sensor_best_de, D_sensor_best_de.
+        self.K_sensor_for_internal_targets = K_initial_ideal_for_opt_data_targets.astype(np.float64)
+        self.D_sensor_for_internal_targets = D_initial_sensor_for_opt_data_targets.copy() if D_initial_sensor_for_opt_data_targets is not None else None
+        
         self.model_type = model_type
         self.img_width = img_width
         self.img_height = img_height
         self.t_rec_map = t_rec_map_us
+
+        # Store the length of D parameters this OptData instance was initialized with.
+        # This is crucial for compute_residuals to correctly slice the optimization vector X.
+        if self.D_sensor_for_internal_targets is not None:
+            self.num_initial_d_params = len(self.D_sensor_for_internal_targets.flatten())
+        else:
+            self.num_initial_d_params = 0
+            
+        # Store the global K_ideal used for normalizing the input p2d_undistorted_pixels
+        self.K_GLOBAL_IDEAL_FOR_UNDIST_NORMALIZATION = K_GLOBAL_IDEAL_FOR_UNDIST_NORMALIZATION.astype(np.float64)
+
 
         # Store debug parameters
         self.debug_image_idx_to_name_map = debug_image_idx_to_name_map
         self.debug_query_image_dir = debug_query_image_dir
         self.debug_output_vis_dir = debug_output_vis_dir
         self.debug_vis_image_indices = debug_vis_image_indices if debug_vis_image_indices is not None else []
-        # self._debug_vis_count = 0 # Use specific indices instead of count
-
 
         self.image_indices = []
-        self.all_p2d_distorted_target = []
+        self.all_p2d_distorted_target = [] 
         self.all_P3d = []
         self.image_idx_to_dt_param_idx_map = {}
 
         current_dt_param_idx = 0
-        sorted_input_image_indices = sorted(inlier_matches_map_us.keys())
+        sorted_input_image_indices_for_optdata = sorted(inlier_matches_map_us.keys())
 
-        for original_img_idx in sorted_input_image_indices:
+        if self.debug_output_vis_dir:
+            self.debug_output_vis_dir.mkdir(parents=True, exist_ok=True)
+
+        for original_img_idx in sorted_input_image_indices_for_optdata:
             p2d_undistorted_pixels, P3d_world = self.inlier_matches_orig_undist[original_img_idx]
 
             if p2d_undistorted_pixels.shape[0] == 0:
                 continue
 
-            p2d_target_dist_pixels = np.zeros_like(p2d_undistorted_pixels, dtype=np.float64)
-
-            if self.model_type == "KANNALA_BRANDT":
-                # ==== 修复1：先将去畸变像素坐标转换为归一化坐标 ====
-                # 获取内参
-                fx = self.K_initial_ideal[0, 0]
-                fy = self.K_initial_ideal[1, 1]
-                cx = self.K_initial_ideal[0, 2]
-                cy = self.K_initial_ideal[1, 2]
-                
-                # 转换为归一化坐标 (x_normalized, y_normalized)
-                p2d_undist_normalized = np.zeros_like(p2d_undistorted_pixels, dtype=np.float64)
-                p2d_undist_normalized[:, 0] = (p2d_undistorted_pixels[:, 0] - cx) / fx
-                p2d_undist_normalized[:, 1] = (p2d_undistorted_pixels[:, 1] - cy) / fy
-
-                # ==== 修复2：使用归一化坐标作为输入 ====
-                p2d_undist_reshaped = p2d_undist_normalized.reshape(-1, 1, 2)  # 已经是float64
-
-                # ==== 修复3：确保D参数格式正确 ====
-                D_sensor_kb_prepared = np.zeros(4, dtype=np.float64)
-                if self.D_initial_sensor is not None:
-                    d_flat = self.D_initial_sensor.flatten()
-                    D_sensor_kb_prepared[:min(4, len(d_flat))] = d_flat[:4].astype(np.float64)
-
-                # ==== 修复4：正确应用畸变并转换回像素坐标 ====
-                K_undist_arg = np.ascontiguousarray(self.K_initial_ideal, dtype=np.float64)
-                D_arg = np.ascontiguousarray(D_sensor_kb_prepared, dtype=np.float64)
-
-                # 应用鱼眼畸变（输入输出都是归一化坐标）
-                distorted_norm_pts = cv2.fisheye.distortPoints(
-                    p2d_undist_reshaped,
-                    K_undist_arg,
-                    D_arg
-                )
-
-                p2d_target_dist_pixels = distorted_norm_pts.reshape(-1, 2)
-
-            elif self.model_type == "PINHOLE":
-                # ... (PINHOLE logic as in your code) ...
-                p2d_undist_norm = np.zeros_like(p2d_undistorted_pixels, dtype=np.float32) 
-                p2d_undist_norm[:, 0] = (p2d_undistorted_pixels[:, 0] - self.K_initial_ideal[0, 2]) / self.K_initial_ideal[0, 0]
-                p2d_undist_norm[:, 1] = (p2d_undistorted_pixels[:, 1] - self.K_initial_ideal[1, 2]) / self.K_initial_ideal[1, 1]
-                P3D_ideal_cam = np.hstack((p2d_undist_norm, np.ones((p2d_undist_norm.shape[0], 1)))).astype(np.float32)
-                rvec_ident = np.zeros(3, dtype=np.float32)
-                tvec_ident = np.zeros(3, dtype=np.float32)
-                D_sensor_pinhole = None
-                if self.D_initial_sensor is not None: D_sensor_pinhole = self.D_initial_sensor.flatten().astype(np.float64)
-                K_for_project_points = self.K_initial_ideal.astype(np.float64)
-                distorted_pts_cv = cv2.projectPoints( P3D_ideal_cam, rvec_ident, tvec_ident, K_for_project_points, D_sensor_pinhole )
-                p2d_target_dist_pixels = distorted_pts_cv.reshape(-1, 2)
-            else:
-                logging.error(f"Unsupported model_type '{self.model_type}' in OptimizationData.")
-                p2d_target_dist_pixels = p2d_undistorted_pixels.copy()
+            internal_p2d_target_dist_pixels = generate_target_distorted_points(
+                p2d_undistorted_pixels=p2d_undistorted_pixels,
+                K_sensor_current=self.K_sensor_for_internal_targets, 
+                D_sensor_current=self.D_sensor_for_internal_targets, 
+                model_type=self.model_type,
+                K_ideal_fixed_for_normalization=self.K_GLOBAL_IDEAL_FOR_UNDIST_NORMALIZATION, # Use the global K_ideal here
+                img_width=self.img_width,
+                img_height=self.img_height
+            )
             
-            # --- DEBUG VISUALIZATION CALL ---
-            if self.debug_output_vis_dir is not None and \
-               self.debug_image_idx_to_name_map is not None and \
-               self.debug_query_image_dir is not None and \
+            # ... (debug visualization call remains the same, using self.K_sensor_for_internal_targets for label) ...
+            if self.debug_output_vis_dir and \
+               self.debug_image_idx_to_name_map and \
+               self.debug_query_image_dir and \
                original_img_idx in self.debug_vis_image_indices:
-
                 image_filename = self.debug_image_idx_to_name_map.get(original_img_idx)
                 if image_filename:
-                    # IMPORTANT: Visualize on the ORIGINAL (distorted) image
                     original_image_file_path_str = str(self.debug_query_image_dir / image_filename)
-                    
-                    # Check if the original image file actually exists
-                    if not Path(original_image_file_path_str).exists():
-                        logging.warning(f"DEBUG VIS: Original image file not found: {original_image_file_path_str}. Skipping visualization for img_idx {original_img_idx}.")
-                    else:
-                        vis_path_str = str(self.debug_output_vis_dir / f"debug_distortPoints_target_img_{original_img_idx}_{Path(image_filename).stem}.png")
-                        logging.info(f"DEBUG VIS: Visualizing cv2.fisheye.distortPoints target for img_idx {original_img_idx} ({image_filename}) to {vis_path_str}")
-                        
-                        # Make sure visualize_2d_points_on_image is accessible here
+                    if Path(original_image_file_path_str).exists():
+                        vis_path_str = str(self.debug_output_vis_dir / f"OptData_internal_target_img_{original_img_idx}_{Path(image_filename).stem}.png")
+                        logging.info(f"DEBUG VIS (OptData Init): Visualizing internal target for img_idx {original_img_idx} to {vis_path_str}")
                         visualize_2d_points_on_image(
                             original_image_path=original_image_file_path_str,
-                            points_2d_to_draw=p2d_target_dist_pixels.copy(), # Pass a copy
+                            points_2d_to_draw=internal_p2d_target_dist_pixels.copy(),
                             output_path=vis_path_str,
-                            label=f"Target Distorted Pts (cv2.distortPoints output) for idx {original_img_idx}",
-                            point_color=(0, 255, 0) # Green for these points
+                            label=f"OptData Internal Target (idx {original_img_idx}) using K_sensor:\n{np.round(self.K_sensor_for_internal_targets[:2,:],2)}", # Label with the K used
+                            point_color=(0, 255, 255)
                         )
-                else:
-                    logging.warning(f"DEBUG VIS: Could not find image filename for original_img_idx {original_img_idx} in map. Skipping visualization.")
-            # --- END DEBUG VISUALIZATION CALL ---
-
+            
             self.image_indices.append(original_img_idx)
-            self.all_p2d_distorted_target.append(p2d_target_dist_pixels)
+            self.all_p2d_distorted_target.append(internal_p2d_target_dist_pixels)
             self.all_P3d.append(P3d_world)
             self.image_idx_to_dt_param_idx_map[original_img_idx] = current_dt_param_idx
             current_dt_param_idx += 1
@@ -2668,7 +2632,6 @@ class OptimizationData:
             self.all_P3d = np.concatenate(self.all_P3d, axis=0)
             self.total_residuals = self.all_p2d_distorted_target.shape[0] * 2
         else:
-            # Handle case with no valid points after processing all images
             self.all_p2d_distorted_target = np.empty((0,2), dtype=np.float64)
             self.all_P3d = np.empty((0,3), dtype=np.float64)
             self.total_residuals = 0
@@ -2680,14 +2643,13 @@ class OptimizationData:
         if len(self.image_idx_to_dt_param_idx_map) != self.num_opt_images:
              logging.error(f"OptData init: Mismatch len(dt_param_map)={len(self.image_idx_to_dt_param_idx_map)} vs num_opt_images={self.num_opt_images}.")
 
-def compute_residuals(X_params_vector, opt_data: OptimizationData): # Renamed X
+def compute_residuals(X_params_vector, opt_data: OptimizationData):
     residuals = np.zeros(opt_data.total_residuals, dtype=np.float64)
     if opt_data.total_residuals == 0:
-        # If total_residuals is 0 due to no points, return empty or correctly shaped zero array
         return residuals if residuals.shape[0] > 0 else np.array([], dtype=np.float64)
 
     try:
-        # --- Unpack Parameters ---
+        # --- Unpack Parameters from X_params_vector (current trial values) ---
         xi_ego_cam_iter = X_params_vector[:6]
 
         fx_iter = X_params_vector[6]
@@ -2696,34 +2658,38 @@ def compute_residuals(X_params_vector, opt_data: OptimizationData): # Renamed X
         cy_iter = X_params_vector[9]
         K_iter = np.array([[fx_iter, 0, cx_iter], [0, fy_iter, cy_iter], [0, 0, 1]], dtype=np.float64)
 
-        num_d_params = 0
-        if opt_data.D_initial_sensor is not None:
-            num_d_params = len(opt_data.D_initial_sensor.flatten())
+        # Use opt_data.num_initial_d_params to know how many D params were configured
+        # and thus how many are present in X_params_vector for D.
+        num_d_params_in_X = opt_data.num_initial_d_params # Corrected: Use stored length
 
-        idx_start_D = 6 + NUM_K_PARAMS # NUM_K_PARAMS is assumed to be 4
-        idx_end_D = idx_start_D + num_d_params
+        idx_start_D = 6 + NUM_K_PARAMS 
+        idx_end_D = idx_start_D + num_d_params_in_X # Corrected: Use num_d_params_in_X
         D_iter_flat = X_params_vector[idx_start_D:idx_end_D]
 
         idx_start_dt = idx_end_D
         all_dt_seconds_iter = X_params_vector[idx_start_dt:]
         # --- End Unpack Parameters ---
 
-        # This function se3_to_SE3 needs to be defined elsewhere
         T_ego_cam_iter = se3_to_SE3(xi_ego_cam_iter) 
         current_residual_offset = 0
         point_counter_for_slicing = 0
 
-        for i in range(opt_data.num_opt_images):
-            original_img_idx = opt_data.image_indices[i]
-            num_matches_for_this_image = opt_data.inlier_matches_orig_undist[original_img_idx][0].shape[0]
-
-            if num_matches_for_this_image == 0:
+        for i in range(opt_data.num_opt_images): # Iterate through images this OptData instance knows about
+            original_img_idx = opt_data.image_indices[i] # Get the global image index
+            
+            # Retrieve the pre-generated target points and 3D points for this image
+            # The number of matches is implicitly handled by the slicing below.
+            num_matches_for_this_image_in_optdata = opt_data.inlier_matches_orig_undist[original_img_idx][0].shape[0]
+            
+            if num_matches_for_this_image_in_optdata == 0: # Should not happen if OptData built correctly
                 continue
 
-            p2d_distorted_target_slice = opt_data.all_p2d_distorted_target[point_counter_for_slicing : point_counter_for_slicing + num_matches_for_this_image]
-            P3d_inliers_slice = opt_data.all_P3d[point_counter_for_slicing : point_counter_for_slicing + num_matches_for_this_image]
-            point_counter_for_slicing += num_matches_for_this_image
+            # These are the internal targets generated by OptData using K_sensor_from_DE, D_sensor_from_DE
+            p2d_distorted_target_slice = opt_data.all_p2d_distorted_target[point_counter_for_slicing : point_counter_for_slicing + num_matches_for_this_image_in_optdata]
+            P3d_inliers_slice = opt_data.all_P3d[point_counter_for_slicing : point_counter_for_slicing + num_matches_for_this_image_in_optdata]
+            point_counter_for_slicing += num_matches_for_this_image_in_optdata
 
+            # Get the dt parameter index for this image within the dt part of X_params_vector
             dt_param_idx_for_image = opt_data.image_idx_to_dt_param_idx_map[original_img_idx]
             dt_i_seconds = all_dt_seconds_iter[dt_param_idx_for_image]
 
@@ -2733,95 +2699,87 @@ def compute_residuals(X_params_vector, opt_data: OptimizationData): # Renamed X
 
             T_map_ego_i = opt_data.ego_interpolator(t_true_i_us)
             if T_map_ego_i is None:
-                residuals[current_residual_offset : current_residual_offset + num_matches_for_this_image * 2] = 1e6
-                current_residual_offset += num_matches_for_this_image * 2
+                residuals[current_residual_offset : current_residual_offset + num_matches_for_this_image_in_optdata * 2] = 1e6
+                current_residual_offset += num_matches_for_this_image_in_optdata * 2
                 continue
 
             T_map_cam_i = T_map_ego_i @ T_ego_cam_iter
             try:
                 T_cam_map_i = np.linalg.inv(T_map_cam_i)
-                
-                # MODIFICATION: Ensure rvec and tvec are C-contiguous
-                # rvec_iter from cv2.Rodrigues is usually contiguous, but being explicit is safer.
-                # The input to Rodrigues should also be contiguous.
                 R_cam_map_i_for_rodrigues = np.ascontiguousarray(T_cam_map_i[:3, :3])
                 rvec_iter, _ = cv2.Rodrigues(R_cam_map_i_for_rodrigues)
-                rvec_iter = np.ascontiguousarray(rvec_iter) # Ensure output is C-contiguous
-
-                # tvec_iter from slicing and reshaping is the primary suspect for non-contiguity
-                tvec_slice = T_cam_map_i[:3, 3] # This is a (3,) view, likely not C-contiguous
-                tvec_iter = np.ascontiguousarray(tvec_slice.reshape(3, 1)) # Reshape then ensure C-contiguity
-
+                rvec_iter = np.ascontiguousarray(rvec_iter)
+                tvec_slice = T_cam_map_i[:3, 3]
+                tvec_iter = np.ascontiguousarray(tvec_slice.reshape(3, 1))
             except np.linalg.LinAlgError:
-                residuals[current_residual_offset : current_residual_offset + num_matches_for_this_image * 2] = 1e6
-                current_residual_offset += num_matches_for_this_image * 2
+                residuals[current_residual_offset : current_residual_offset + num_matches_for_this_image_in_optdata * 2] = 1e6
+                current_residual_offset += num_matches_for_this_image_in_optdata * 2
                 continue
             
-            p_proj_distorted_iter_pixels = np.full((num_matches_for_this_image, 2), 1e6, dtype=np.float64)
-            P3d_inliers_reshaped_for_proj = P3d_inliers_slice.reshape(-1, 1, 3) if opt_data.model_type == "KANNALA_BRANDT" else P3d_inliers_slice
-
-            P3d_h = np.hstack((P3d_inliers_slice, np.ones((num_matches_for_this_image, 1))))
-            P_cam_h = (T_cam_map_i @ P3d_h.T).T
+            p_proj_distorted_iter_pixels = np.full((num_matches_for_this_image_in_optdata, 2), 1e6, dtype=np.float64)
             
-            valid_for_projection_mask = np.zeros(num_matches_for_this_image, dtype=bool)
-            front_of_camera_mask = P_cam_h[:, 2] > 1e-3
+            # Prepare 3D points for projection functions based on model type
+            P3d_for_cv_proj = None
+            if opt_data.model_type == "KANNALA_BRANDT":
+                P3d_for_cv_proj = P3d_inliers_slice.reshape(-1, 1, 3).astype(np.float32) # Needs to be float32 for cv2.fisheye
+            elif opt_data.model_type == "PINHOLE":
+                P3d_for_cv_proj = P3d_inliers_slice.astype(np.float32) # Needs to be float32 for cv2.projectPoints
+            else: # Should not happen if model_type is validated earlier
+                 P3d_for_cv_proj = P3d_inliers_slice.astype(np.float32)
+
+
+            P3d_h = np.hstack((P3d_inliers_slice, np.ones((num_matches_for_this_image_in_optdata, 1))))
+            P_cam_h = (T_cam_map_i @ P3d_h.T).T
+            front_of_camera_mask = P_cam_h[:, 2] > 1e-3 # Check Z > 0 in camera frame
             
             if np.any(front_of_camera_mask):
-                # Ensure P3d_to_project_actual is C-contiguous as boolean masking can create non-contiguous arrays
-                P3d_to_project_actual_non_cont = P3d_inliers_reshaped_for_proj[front_of_camera_mask]
-                P3d_to_project_actual = np.ascontiguousarray(P3d_to_project_actual_non_cont)
-
+                P3d_to_project_actual = np.ascontiguousarray(P3d_for_cv_proj[front_of_camera_mask])
 
                 projected_points_cv = None
-                if opt_data.model_type == "KANNALA_BRANDT":
-                    D_fisheye_iter = np.zeros(4, dtype=np.float64) # Ensure it's (4,)
-                    if len(D_iter_flat) >= 4:
-                        D_fisheye_iter = D_iter_flat[:4].astype(np.float64)
-                    else:
-                        D_fisheye_iter[:len(D_iter_flat)] = D_iter_flat.astype(np.float64)
-                    D_fisheye_iter = np.ascontiguousarray(D_fisheye_iter)
+                if P3d_to_project_actual.shape[0] > 0: # Ensure there are points to project
+                    if opt_data.model_type == "KANNALA_BRANDT":
+                        D_fisheye_iter = np.zeros(4, dtype=np.float64) 
+                        if num_d_params_in_X >= 4: # Use num_d_params_in_X from opt_data
+                            D_fisheye_iter = D_iter_flat[:4].astype(np.float64)
+                        elif num_d_params_in_X > 0 :
+                            D_fisheye_iter[:num_d_params_in_X] = D_iter_flat.astype(np.float64)
+                        D_fisheye_iter = np.ascontiguousarray(D_fisheye_iter)
+                        projected_points_cv, _ = cv2.fisheye.projectPoints(
+                            P3d_to_project_actual, rvec_iter, tvec_iter, K_iter, D_fisheye_iter
+                        )
+                    elif opt_data.model_type == "PINHOLE":
+                        D_pinhole_iter = np.array([], dtype=np.float64)
+                        if num_d_params_in_X > 0: # Use num_d_params_in_X from opt_data
+                            D_pinhole_iter = D_iter_flat.astype(np.float64)
+                        # Pad/truncate D_pinhole_iter for OpenCV if needed
+                        expected_pinhole_d_len = 5 
+                        if len(D_pinhole_iter) < expected_pinhole_d_len and num_d_params_in_X > 0:
+                            _temp_D = np.zeros(expected_pinhole_d_len, dtype=np.float64)
+                            _temp_D[:len(D_pinhole_iter)] = D_pinhole_iter
+                            D_pinhole_iter = _temp_D
+                        elif len(D_pinhole_iter) > expected_pinhole_d_len:
+                            D_pinhole_iter = D_pinhole_iter[:expected_pinhole_d_len]
+                        elif num_d_params_in_X == 0: # No D params being optimized
+                             D_pinhole_iter = None # Pass None to projectPoints
 
-
-                    projected_points_cv, _ = cv2.fisheye.projectPoints(
-                        P3d_to_project_actual, rvec_iter, tvec_iter, K_iter, D_fisheye_iter
-                    )
-                elif opt_data.model_type == "PINHOLE":
-                    D_pinhole_iter = D_iter_flat.astype(np.float64) # Ensure correct type
-                    # Pad or truncate D for standard pinhole models (e.g., 5, 8, or 12 params)
-                    # Assuming a 5-param model (k1,k2,p1,p2,k3) for this example if D_iter_flat might be shorter
-                    if len(D_iter_flat) < 5:
-                        D_pinhole_padded = np.zeros(5, dtype=np.float64)
-                        D_pinhole_padded[:len(D_iter_flat)] = D_iter_flat
-                        D_pinhole_iter = D_pinhole_padded
-                    elif len(D_iter_flat) > 5 : # If you expect exactly 5, you might truncate or error
-                        D_pinhole_iter = D_iter_flat[:5]
-                    D_pinhole_iter = np.ascontiguousarray(D_pinhole_iter)
-
-
-                    projected_points_cv, _ = cv2.projectPoints(
-                        np.ascontiguousarray(P3d_to_project_actual), # Ensure P3d also contiguous here for projectPoints
-                        rvec_iter, tvec_iter, K_iter, D_pinhole_iter
-                    )
-                else:
-                    pass 
-
+                        D_pinhole_iter_arg = np.ascontiguousarray(D_pinhole_iter) if D_pinhole_iter is not None else None
+                        projected_points_cv, _ = cv2.projectPoints(
+                            P3d_to_project_actual, rvec_iter, tvec_iter, K_iter, D_pinhole_iter_arg
+                        )
+                
                 if projected_points_cv is not None:
                     projected_points_flat = projected_points_cv.reshape(-1, 2)
                     p_proj_distorted_iter_pixels[front_of_camera_mask] = projected_points_flat
-                    valid_for_projection_mask[front_of_camera_mask] = True
 
             r_i_slice = p2d_distorted_target_slice - p_proj_distorted_iter_pixels
-            residuals[current_residual_offset : current_residual_offset + num_matches_for_this_image * 2] = r_i_slice.flatten()
-            current_residual_offset += num_matches_for_this_image * 2
+            residuals[current_residual_offset : current_residual_offset + num_matches_for_this_image_in_optdata * 2] = r_i_slice.flatten()
+            current_residual_offset += num_matches_for_this_image_in_optdata * 2
 
     except Exception as e:
         logging.error(f"Error in compute_residuals: {e}\n{traceback.format_exc()}")
-        # Ensure returned array has the correct size even in case of early error
         return np.full(opt_data.total_residuals if opt_data.total_residuals > 0 else 1, 1e6, dtype=np.float64)
 
-
     if not np.all(np.isfinite(residuals)):
-        logging.warning("Non-finite values detected in residuals! Replacing with 1e6.") # Changed to warning
         residuals[~np.isfinite(residuals)] = 1e6
     return residuals
 
@@ -3095,11 +3053,11 @@ def calculate_robust_cost_for_de(residuals, loss_type='cauchy', scale_c=1.0):
 # --- Hybrid Refinement Function ---
 de_eval_count_global = 0 # Keep this global or make it part of objective_data_dict if preferred
 
-def de_objective_func_global(X_de_trial, objective_data_dict):
+def de_objective_func_global(X_de_trial, objective_data_dict): # X_de_trial: [xi_ego_cam, k_params_sensor, d_params_sensor]
     global de_eval_count_global
     de_eval_count_global += 1
 
-    # Unpack X_de_trial (Global parameters only)
+    # Unpack X_de_trial (Global parameters from DE)
     xi_ego_cam_trial = X_de_trial[:6]
     k_params_sensor_trial = X_de_trial[6:6+NUM_K_PARAMS] # NUM_K_PARAMS must be defined
     num_d_params_from_data = objective_data_dict["num_d_params"]
@@ -3115,65 +3073,86 @@ def de_objective_func_global(X_de_trial, objective_data_dict):
                                    [0, k_params_sensor_trial[1], k_params_sensor_trial[3]],
                                    [0, 0, 1]])
     except Exception:
+        # logging.debug(f"DE Eval {de_eval_count_global}: Invalid se3 or K params. Cost=inf") # Reduce log noise
         return np.inf # Invalid transform or K parameters, penalize heavily
 
     total_robust_cost_for_de_trial = 0.0
     total_points_contributing = 0
+    inner_dt_optim_failed_count = 0
 
     # Iterate through each image that has PnP inliers
     for img_idx in objective_data_dict["query_indices_for_opt"]:
-        # p2d_undist_ideal_kps_img are the 2D keypoints on the IDEAL (undistorted) image plane
         # P3d_world_img are the corresponding 3D world points
-        p2d_undist_ideal_kps_img, P3d_world_img = objective_data_dict["inlier_matches_map_undistorted_ideal"][img_idx]
+        P3d_world_img = objective_data_dict["inlier_matches_map_undistorted_ideal"][img_idx][1]
 
-        if p2d_undist_ideal_kps_img.shape[0] == 0:
-            continue # Skip if no inliers for this image
+        # --- MODIFICATION: Retrieve PRE-CALCULATED target distorted points ---
+        # These targets were generated using the INITIAL K_sensor and D_sensor
+        # and represent the "ground truth" distorted points on the sensor for the given ideal keypoints.
+        p2d_target_distorted_on_sensor_fixed_img = objective_data_dict["precalculated_target_distorted_points"][img_idx]
+        # --- END MODIFICATION ---
+
+        if P3d_world_img.shape[0] == 0 or p2d_target_distorted_on_sensor_fixed_img.shape[0] == 0:
+            # This case implies the pre-calculation of targets might have failed for this image,
+            # or there were no 3D points.
+            # If p2d_target_distorted_on_sensor_fixed_img is empty, it implies no valid targets to match.
+            # Add a penalty or skip. For now, if either is empty, this image contributes nothing or a penalty.
+            # If P3d_world_img.shape[0] > 0 but target is empty, it's an issue.
+            if P3d_world_img.shape[0] > 0 and p2d_target_distorted_on_sensor_fixed_img.shape[0] == 0:
+                 penalty_per_point_val = 1e12
+                 if de_robust_loss_type == 'cauchy': penalty_per_point_val = 0.5 * de_robust_loss_scale**2 * np.log1p( (1e6/de_robust_loss_scale)**2 )
+                 total_robust_cost_for_de_trial += penalty_per_point_val * P3d_world_img.shape[0] * 2
+                 total_points_contributing += P3d_world_img.shape[0]
+            continue
+
 
         t_rec_us_img = objective_data_dict["query_timestamps_rec_us"][img_idx]
 
-        # 1. Generate "target" distorted points on the SENSOR image
-        #    These targets are what the p2d_undist_ideal_kps_img *would look like* if viewed
-        #    by the current K_sensor_trial and D_sensor_trial.
-        p2d_target_distorted_on_sensor = generate_target_distorted_points(
-            p2d_undistorted_pixels=p2d_undist_ideal_kps_img,
-            K_sensor_current=K_sensor_trial,
-            D_sensor_current=d_params_sensor_trial,
-            model_type=objective_data_dict["model_type"],
-            K_ideal_fixed_for_normalization=objective_data_dict["K_initial_ideal_for_undistorted_input"],
-            img_width=objective_data_dict["img_width"],
-            img_height=objective_data_dict["img_height"]
-        )
+        # --- Inner Loop: Optimize dt for the current T_ego_cam_trial, K_sensor_trial, D_sensor_trial ---
+        # The compute_residuals_timestamp_only_revised_for_de function will project P3d_world_img
+        # using the *trial* T_ego_cam, K_sensor, D_sensor and the *optimized dt* for this image,
+        # and compare against the p2d_target_distorted_on_sensor_fixed_img.
+        
+        # dt_optimized_s, status_dt_opt, _, _, _ = refine_timestamp_only_revised_for_de(
+        #     current_T_ego_cam=T_ego_cam_trial,
+        #     current_K_matrix_sensor=K_sensor_trial,
+        #     current_D_coeffs_sensor=d_params_sensor_trial,
+        #     current_model_type=objective_data_dict["model_type"],
+        #     current_img_width=objective_data_dict["img_width"],
+        #     current_img_height=objective_data_dict["img_height"],
+        #     p2d_target_distorted_pixels=p2d_target_distorted_on_sensor_fixed_img, # Fixed target points
+        #     P3d_world_points=P3d_world_img,
+        #     t_rec_us=t_rec_us_img,
+        #     ego_interpolator_us=objective_data_dict["ego_interpolator_us"],
+        #     dt_bounds_seconds=objective_data_dict["dt_bounds_seconds_de_inner_opt"],
+        #     loss_function='linear', # Inner LS for dt always linear for speed
+        #     verbose=0 
+        # )
 
-        if p2d_target_distorted_on_sensor.shape[0] == 0:
-            # If target generation fails (e.g., points behind camera after normalization step inside generate_target)
-            # This indicates an issue with K_sensor_trial or D_sensor_trial for these points
-            penalty_per_point = 1e12
-            if de_robust_loss_type == 'cauchy':
-                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18)
-            total_robust_cost_for_de_trial += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
-            total_points_contributing += p2d_undist_ideal_kps_img.shape[0]
-            continue
+        # current_dt_for_residuals = 0.0 # Default if dt opt fails
+        # if dt_optimized_s is not None and status_dt_opt >= 0 :
+        #     current_dt_for_residuals = dt_optimized_s
+        # else:
+        #     inner_dt_optim_failed_count += 1
 
-        # 2. Compute raw reprojection residuals for this image using dt = 0 seconds
-        #    The `compute_residuals_timestamp_only_revised_for_de` function calculates the
-        #    difference between these `p2d_target_distorted_on_sensor` and the
-        #    3D points reprojected using the trial T_ego_cam, K_sensor, D_sensor, and a given dt.
-        #    Here, we set dt = 0 for the DE evaluation.
+        current_dt_for_residuals = 0.0
+            
+        # Re-evaluate residuals with the (potentially optimized) dt to get raw residuals
+        # for the outer DE robust cost calculation.
         raw_residuals_for_image = compute_residuals_timestamp_only_revised_for_de(
-            dt_scalar_seconds=0.0, # IMPORTANT: dt is fixed to 0 for DE objective
+            dt_scalar_seconds=current_dt_for_residuals, 
             fixed_T_ego_cam=T_ego_cam_trial,
             fixed_K_matrix_sensor=K_sensor_trial,
             fixed_D_coeffs_sensor=d_params_sensor_trial,
             fixed_model_type=objective_data_dict["model_type"],
             fixed_img_width=objective_data_dict["img_width"],
             fixed_img_height=objective_data_dict["img_height"],
-            p2d_target_distorted_pixels=p2d_target_distorted_on_sensor, # The targets generated above
+            p2d_target_distorted_pixels=p2d_target_distorted_on_sensor_fixed_img,
             P3d_world_points=P3d_world_img,
             t_rec_us=t_rec_us_img,
             ego_interpolator_us=objective_data_dict["ego_interpolator_us"]
         )
 
-        # 3. Apply robust loss to the raw residuals
+        # Apply robust loss to the raw residuals for the outer DE objective
         if raw_residuals_for_image.size > 0 and np.all(np.isfinite(raw_residuals_for_image)):
             cost_this_image_robust = calculate_robust_cost_for_de(
                 raw_residuals_for_image,
@@ -3181,41 +3160,44 @@ def de_objective_func_global(X_de_trial, objective_data_dict):
                 scale_c=de_robust_loss_scale
             )
             total_robust_cost_for_de_trial += cost_this_image_robust
-            total_points_contributing += p2d_undist_ideal_kps_img.shape[0]
+            total_points_contributing += P3d_world_img.shape[0] 
         else:
-            # Penalize if residuals are non-finite or empty (unexpected if p2d_undist_ideal_kps_img > 0)
-            penalty_per_point = 1e12
-            if de_robust_loss_type == 'cauchy':
-                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18) # Approx large val for cauchy
-            total_robust_cost_for_de_trial += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
-            total_points_contributing += p2d_undist_ideal_kps_img.shape[0]
+            penalty_per_point_val = 1e12 
+            if de_robust_loss_type == 'cauchy': penalty_per_point_val = 0.5 * de_robust_loss_scale**2 * np.log1p( (1e6/de_robust_loss_scale)**2 )
+            elif de_robust_loss_type == 'huber': penalty_per_point_val = 0.5 * (2 * de_robust_loss_scale * 1e6 - de_robust_loss_scale**2)
+            total_robust_cost_for_de_trial += penalty_per_point_val * P3d_world_img.shape[0] * 2 
+            total_points_contributing += P3d_world_img.shape[0]
 
-    if total_points_contributing == 0: # No points processed across all images
+    if total_points_contributing == 0: 
         return np.inf
 
-    # Average cost per residual component (a point has 2 components: x, y error)
     avg_robust_cost = total_robust_cost_for_de_trial / (total_points_contributing * 2.0) if total_points_contributing > 0 else np.inf
 
-    # Optional: Logging
-    if de_eval_count_global % (objective_data_dict.get('de_popsize_factor_for_log', 15) * 10) == 0:
-        logging.debug(f"DE Eval {de_eval_count_global}: AvgRobustCost={avg_robust_cost:.4e} (Loss: {de_robust_loss_type}, Scale: {de_robust_loss_scale}) for X_de_trial[0:3]={np.round(X_de_trial[:3],3)}")
+    log_freq = objective_data_dict.get('de_popsize_factor_for_log', 15) * 20 
+    if de_eval_count_global % log_freq == 0:
+        xi_str = ", ".join([f"{x:.3f}" for x in X_de_trial[:3]]) 
+        k_str = ", ".join([f"{x:.2f}" for x in X_de_trial[6:8]]) 
+        dt_fails_str = f", dt_fails={inner_dt_optim_failed_count}" if inner_dt_optim_failed_count > 0 else ""
+        logging.debug(f"DE Eval {de_eval_count_global}: AvgRobCost={avg_robust_cost:.4e} (Loss: {de_robust_loss_type}, Scale: {de_robust_loss_scale}) for xi_rot=[{xi_str}], K_f=[{k_str}]{dt_fails_str}")
 
     return avg_robust_cost
 
 def de_objective_func_stage1_extrinsics_only(xi_ego_cam_trial, objective_data_dict_stage1):
     """
     Objective function for DE Stage 1: Optimize T_ego_cam (extrinsics) only.
-    Intrinsics (K_sensor, D_sensor) are taken as fixed (initial/trusted values).
+    Intrinsics (K_sensor, D_sensor) are taken as fixed (initial/trusted values from config).
+    The target points are pre-calculated based on these initial fixed intrinsics.
     Time offsets (dt) are assumed to be 0.
     """
-
-    # Fixed K and D for this stage (passed in objective_data_dict_stage1)
-    K_sensor_fixed = objective_data_dict_stage1["K_sensor_fixed"]
-    D_sensor_fixed = objective_data_dict_stage1["D_sensor_fixed"]
+    # Fixed K and D for projection in this stage (initial sensor config values)
+    K_sensor_for_projection_s1 = objective_data_dict_stage1["K_sensor_for_projection_in_stage1"]
+    D_sensor_for_projection_s1 = objective_data_dict_stage1["D_sensor_for_projection_in_stage1"]
     model_type = objective_data_dict_stage1["model_type"]
-    K_ideal_for_norm = objective_data_dict_stage1["K_initial_ideal_for_undistorted_input"]
     img_width = objective_data_dict_stage1["img_width"]
     img_height = objective_data_dict_stage1["img_height"]
+
+    # Global fixed target points (pre-calculated using initial sensor config)
+    global_fixed_targets_map = objective_data_dict_stage1["precalculated_target_distorted_points_map_GLOBAL"]
 
     # Robust loss settings
     de_robust_loss_type = objective_data_dict_stage1.get("de_robust_loss_type", "linear")
@@ -3230,48 +3212,44 @@ def de_objective_func_stage1_extrinsics_only(xi_ego_cam_trial, objective_data_di
     total_points_contributing_stage1 = 0
 
     for img_idx in objective_data_dict_stage1["query_indices_for_opt"]:
-        p2d_undist_ideal_kps_img, P3d_world_img = objective_data_dict_stage1["inlier_matches_map_undistorted_ideal"][img_idx]
-        if p2d_undist_ideal_kps_img.shape[0] == 0:
+        # P3d_world_img are the 3D points for this image
+        _, P3d_world_img = objective_data_dict_stage1["inlier_matches_map_undistorted_ideal"][img_idx]
+        
+        # Fetch the globally fixed target for this image
+        p2d_fixed_target_distorted_img = global_fixed_targets_map.get(img_idx)
+
+        if P3d_world_img.shape[0] == 0 or p2d_fixed_target_distorted_img is None or p2d_fixed_target_distorted_img.shape[0] == 0:
+            # If P3d points exist but target is missing/empty, penalize.
+            # (This case should ideally be prevented by ensuring global_fixed_targets_map is complete for query_indices_for_opt)
+            if P3d_world_img.shape[0] > 0:
+                penalty_per_point = 1e12 
+                if de_robust_loss_type == 'cauchy': penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log1p( (1e6/de_robust_loss_scale)**2 )
+                total_robust_cost_stage1 += penalty_per_point * P3d_world_img.shape[0] * 2 
+                total_points_contributing_stage1 += P3d_world_img.shape[0]
             continue
         
         t_rec_us_img = objective_data_dict_stage1["query_timestamps_rec_us"][img_idx]
-
-        # 1. Generate "target" distorted points using the FIXED K_sensor_fixed, D_sensor_fixed
-        p2d_target_distorted_on_sensor = generate_target_distorted_points(
-            p2d_undistorted_pixels=p2d_undist_ideal_kps_img,
-            K_sensor_current=K_sensor_fixed, # Using fixed K
-            D_sensor_current=D_sensor_fixed, # Using fixed D
-            model_type=model_type,
-            K_ideal_fixed_for_normalization=K_ideal_for_norm,
-            img_width=img_width,
-            img_height=img_height
-        )
-
-        if p2d_target_distorted_on_sensor.shape[0] == 0:
-            penalty_per_point = 1e12 # Penalize if target generation fails
-            if de_robust_loss_type == 'cauchy':
-                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18)
-            total_robust_cost_stage1 += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
-            total_points_contributing_stage1 += p2d_undist_ideal_kps_img.shape[0]
-            continue
-
-        # 2. Compute raw reprojection residuals using TRIAL T_ego_cam_trial,
-        #    FIXED K_sensor_fixed, D_sensor_fixed, and dt = 0.
+            
+        # Compute raw reprojection residuals using:
+        # - TRIAL T_ego_cam_trial
+        # - FIXED K_sensor_for_projection_s1, D_sensor_for_projection_s1 (from initial config)
+        # - dt = 0
+        # - Against the p2d_fixed_target_distorted_img
         raw_residuals_for_image = compute_residuals_timestamp_only_revised_for_de(
-            dt_scalar_seconds=0.0, # dt = 0 for this stage
-            fixed_T_ego_cam=T_ego_cam_trial, # Trial extrinsics
-            fixed_K_matrix_sensor=K_sensor_fixed, # Fixed K
-            fixed_D_coeffs_sensor=D_sensor_fixed, # Fixed D
+            dt_scalar_seconds=0.0, 
+            fixed_T_ego_cam=T_ego_cam_trial,                 # Trial extrinsics
+            fixed_K_matrix_sensor=K_sensor_for_projection_s1, # Fixed K for projection
+            fixed_D_coeffs_sensor=D_sensor_for_projection_s1, # Fixed D for projection
             fixed_model_type=model_type,
             fixed_img_width=img_width,
             fixed_img_height=img_height,
-            p2d_target_distorted_pixels=p2d_target_distorted_on_sensor,
+            p2d_target_distorted_pixels=p2d_fixed_target_distorted_img, # Global fixed target
             P3d_world_points=P3d_world_img,
             t_rec_us=t_rec_us_img,
             ego_interpolator_us=objective_data_dict_stage1["ego_interpolator_us"]
         )
 
-        # 3. Apply robust loss
+        # Apply robust loss
         if raw_residuals_for_image.size > 0 and np.all(np.isfinite(raw_residuals_for_image)):
             cost_this_image_robust = calculate_robust_cost_for_de(
                 raw_residuals_for_image,
@@ -3279,25 +3257,25 @@ def de_objective_func_stage1_extrinsics_only(xi_ego_cam_trial, objective_data_di
                 scale_c=de_robust_loss_scale
             )
             total_robust_cost_stage1 += cost_this_image_robust
-            total_points_contributing_stage1 += p2d_undist_ideal_kps_img.shape[0]
-        else:
+            total_points_contributing_stage1 += P3d_world_img.shape[0]
+        else: # Penalize if residuals are bad
             penalty_per_point = 1e12
-            if de_robust_loss_type == 'cauchy':
-                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18)
-            total_robust_cost_stage1 += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
-            total_points_contributing_stage1 += p2d_undist_ideal_kps_img.shape[0]
+            if de_robust_loss_type == 'cauchy': penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log1p((1e6/de_robust_loss_scale)**2)
+            total_robust_cost_stage1 += penalty_per_point * P3d_world_img.shape[0] * 2
+            total_points_contributing_stage1 += P3d_world_img.shape[0]
+
 
     if total_points_contributing_stage1 == 0:
         return np.inf
 
     avg_robust_cost = total_robust_cost_stage1 / (total_points_contributing_stage1 * 2.0) if total_points_contributing_stage1 > 0 else np.inf
-        
     return avg_robust_cost
 
 def de_objective_func_stage2_intrinsics_only(intrinsics_params_trial, objective_data_dict_stage2):
     """
     Objective function for DE Stage 2: Optimize K_sensor, D_sensor (intrinsics) only.
     T_ego_cam (extrinsics) is taken as fixed (from Stage 1 result).
+    The target points are pre-calculated based on the initial sensor config.
     Time offsets (dt) are assumed to be 0.
     """
     # intrinsics_params_trial = [k_params_sensor_trial (4), d_params_sensor_trial (N_d)]
@@ -3308,9 +3286,11 @@ def de_objective_func_stage2_intrinsics_only(intrinsics_params_trial, objective_
     # Fixed T_ego_cam for this stage
     T_ego_cam_fixed = objective_data_dict_stage2["T_ego_cam_fixed"] # From Stage 1
     model_type = objective_data_dict_stage2["model_type"]
-    K_ideal_for_norm = objective_data_dict_stage2["K_initial_ideal_for_undistorted_input"]
     img_width = objective_data_dict_stage2["img_width"]
     img_height = objective_data_dict_stage2["img_height"]
+
+    # Global fixed target points (pre-calculated using initial sensor config)
+    global_fixed_targets_map = objective_data_dict_stage2["precalculated_target_distorted_points_map_GLOBAL"]
 
     # Robust loss settings
     de_robust_loss_type = objective_data_dict_stage2.get("de_robust_loss_type", "linear")
@@ -3327,48 +3307,42 @@ def de_objective_func_stage2_intrinsics_only(intrinsics_params_trial, objective_
     total_points_contributing_stage2 = 0
 
     for img_idx in objective_data_dict_stage2["query_indices_for_opt"]:
-        p2d_undist_ideal_kps_img, P3d_world_img = objective_data_dict_stage2["inlier_matches_map_undistorted_ideal"][img_idx]
-        if p2d_undist_ideal_kps_img.shape[0] == 0:
-            continue
+        # P3d_world_img are the 3D points for this image
+        _, P3d_world_img = objective_data_dict_stage2["inlier_matches_map_undistorted_ideal"][img_idx]
         
-        t_rec_us_img = objective_data_dict_stage2["query_timestamps_rec_us"][img_idx]
-
-        # 1. Generate "target" distorted points using the TRIAL K_sensor_trial, D_sensor_trial
-        p2d_target_distorted_on_sensor = generate_target_distorted_points(
-            p2d_undistorted_pixels=p2d_undist_ideal_kps_img,
-            K_sensor_current=K_sensor_trial, # Trial K
-            D_sensor_current=d_params_sensor_trial, # Trial D
-            model_type=model_type,
-            K_ideal_fixed_for_normalization=K_ideal_for_norm,
-            img_width=img_width,
-            img_height=img_height
-        )
-
-        if p2d_target_distorted_on_sensor.shape[0] == 0:
-            penalty_per_point = 1e12
-            if de_robust_loss_type == 'cauchy':
-                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18)
-            total_robust_cost_stage2 += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
-            total_points_contributing_stage2 += p2d_undist_ideal_kps_img.shape[0]
+        # Fetch the globally fixed target for this image
+        p2d_fixed_target_distorted_img = global_fixed_targets_map.get(img_idx)
+        
+        if P3d_world_img.shape[0] == 0 or p2d_fixed_target_distorted_img is None or p2d_fixed_target_distorted_img.shape[0] == 0:
+            if P3d_world_img.shape[0] > 0: # Penalize if 3D points exist but target missing
+                penalty_per_point = 1e12
+                if de_robust_loss_type == 'cauchy': penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log1p((1e6/de_robust_loss_scale)**2)
+                total_robust_cost_stage2 += penalty_per_point * P3d_world_img.shape[0] * 2
+                total_points_contributing_stage2 += P3d_world_img.shape[0]
             continue
             
-        # 2. Compute raw reprojection residuals using FIXED T_ego_cam_fixed,
-        #    TRIAL K_sensor_trial, D_sensor_trial, and dt = 0.
+        t_rec_us_img = objective_data_dict_stage2["query_timestamps_rec_us"][img_idx]
+            
+        # Compute raw reprojection residuals using:
+        # - FIXED T_ego_cam_fixed (from Stage 1)
+        # - TRIAL K_sensor_trial, d_params_sensor_trial
+        # - dt = 0
+        # - Against the p2d_fixed_target_distorted_img
         raw_residuals_for_image = compute_residuals_timestamp_only_revised_for_de(
-            dt_scalar_seconds=0.0, # dt = 0 for this stage
-            fixed_T_ego_cam=T_ego_cam_fixed, # Fixed T
-            fixed_K_matrix_sensor=K_sensor_trial, # Trial K
-            fixed_D_coeffs_sensor=d_params_sensor_trial, # Trial D
+            dt_scalar_seconds=0.0, 
+            fixed_T_ego_cam=T_ego_cam_fixed,                 # Fixed T from Stage 1
+            fixed_K_matrix_sensor=K_sensor_trial,           # Trial K for projection
+            fixed_D_coeffs_sensor=d_params_sensor_trial,    # Trial D for projection
             fixed_model_type=model_type,
             fixed_img_width=img_width,
             fixed_img_height=img_height,
-            p2d_target_distorted_pixels=p2d_target_distorted_on_sensor,
+            p2d_target_distorted_pixels=p2d_fixed_target_distorted_img, # Global fixed target
             P3d_world_points=P3d_world_img,
             t_rec_us=t_rec_us_img,
             ego_interpolator_us=objective_data_dict_stage2["ego_interpolator_us"]
         )
 
-        # 3. Apply robust loss
+        # Apply robust loss
         if raw_residuals_for_image.size > 0 and np.all(np.isfinite(raw_residuals_for_image)):
             cost_this_image_robust = calculate_robust_cost_for_de(
                 raw_residuals_for_image,
@@ -3376,80 +3350,76 @@ def de_objective_func_stage2_intrinsics_only(intrinsics_params_trial, objective_
                 scale_c=de_robust_loss_scale
             )
             total_robust_cost_stage2 += cost_this_image_robust
-            total_points_contributing_stage2 += p2d_undist_ideal_kps_img.shape[0]
-        else:
+            total_points_contributing_stage2 += P3d_world_img.shape[0]
+        else: # Penalize
             penalty_per_point = 1e12
-            if de_robust_loss_type == 'cauchy':
-                 penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log(1e18)
-            total_robust_cost_stage2 += penalty_per_point * p2d_undist_ideal_kps_img.shape[0] * 2
-            total_points_contributing_stage2 += p2d_undist_ideal_kps_img.shape[0]
+            if de_robust_loss_type == 'cauchy': penalty_per_point = 0.5 * de_robust_loss_scale**2 * np.log1p((1e6/de_robust_loss_scale)**2)
+            total_robust_cost_stage2 += penalty_per_point * P3d_world_img.shape[0] * 2
+            total_points_contributing_stage2 += P3d_world_img.shape[0]
 
 
     if total_points_contributing_stage2 == 0:
         return np.inf
 
     avg_robust_cost = total_robust_cost_stage2 / (total_points_contributing_stage2 * 2.0) if total_points_contributing_stage2 > 0 else np.inf
-        
     return avg_robust_cost
 
-def refine_all_parameters_staged( # New name for the staged approach
+def refine_all_parameters_staged(
+    # --- Renamed for clarity ---
     initial_T_ego_cam_from_config: np.ndarray,
-    pnp_derived_T_ego_cam_guess: np.ndarray, # Can be used to center Stage 1 DE
+    pnp_derived_T_ego_cam_guess: np.ndarray, 
     inlier_matches_map_undistorted_ideal: dict,
     ego_timestamps_us: np.ndarray,
     ego_poses: list,
     query_indices_for_opt: list,
     query_timestamps_rec_us: dict,
-    K_initial_ideal_for_undistorted_input: np.ndarray, # This is K_ideal
-    initial_D_sensor_coeffs: np.ndarray, # This is D_sensor initial
+    K_ideal_plane_definition: np.ndarray, # K defining the ideal undistorted plane of input 2D points
+    K_initial_sensor_cfg: np.ndarray,         # Initial K of the physical sensor (from config)
+    initial_D_sensor_coeffs_cfg: np.ndarray,  # Initial D of the physical sensor (from config)
+    # --- End Renamed ---
     model_type: str,
     img_width: int, img_height: int,
-    # --- Stage 1 DE Extrinsics Parameters ---
-    stage1_de_xi_bounds_abs_offset: np.ndarray = np.array([0.1, 0.1, 0.1, 0.2, 0.2, 0.2]), # Offset for xi bounds
+    stage1_de_xi_bounds_abs_offset: np.ndarray = np.array([0.1, 0.1, 0.1, 0.2, 0.2, 0.2]),
     stage1_de_popsize_factor: int = 15,
-    stage1_de_maxiter: int = 100, # Might need fewer iterations if only optimizing 6 params
-    # --- Stage 2 DE Intrinsics Parameters ---
-    stage2_de_k_bounds_rel_offset: tuple[float, float] = (0.9, 1.1), # e.g., fx_init * 0.9 to fx_init * 1.1
-    stage2_de_cxcy_bounds_abs_offset_px: float = 30.0, # e.g., cx_init +/- 30px
-    stage2_de_d_bounds_abs_offset: np.ndarray = None, # e.g. np.array([0.03,0.02,0.005,0.005]) for KB k1-k4
+    stage1_de_maxiter: int = 100,
+    stage2_de_k_bounds_rel_offset: tuple[float, float] = (0.9, 1.1),
+    stage2_de_cxcy_bounds_abs_offset_px: float = 30.0,
+    stage2_de_d_bounds_abs_offset: np.ndarray = None,
     stage2_de_popsize_factor: int = 15,
     stage2_de_maxiter: int = 100,
-    # --- Shared DE/LS Parameters ---
     de_robust_loss_type: str = 'cauchy',
     de_robust_loss_scale: float = 5.0,
     de_workers: int = -1,
-    # --- Stage 3 (Final LS) Parameters (similar to original hybrid) ---
     dt_bounds_seconds_final_ls: tuple[float, float] = (-0.05, 0.05),
     loss_function_final_ls: str = 'cauchy',
     final_ls_verbose: int = 1,
     final_ls_xi_bounds_abs_offset: np.ndarray = np.array([0.03, 0.03, 0.03, 0.08, 0.08, 0.08]),
     final_ls_k_bounds_rel_offset: tuple[float, float] = (0.98, 1.02),
     final_ls_cxcy_bounds_abs_offset_px: float = 10.0,
-    final_ls_d_bounds_abs_offset_scale: float = 0.05, # e.g. d_init +/- (0.05*abs(d_init) + 0.008)
+    final_ls_d_bounds_abs_offset_scale: float = 0.05,
     final_ls_d_bounds_abs_offset_const: float = 0.008,
-    # --- Common params ---
     interpolation_tolerance_us: int = 1,
-    intrinsic_bounds_config: dict = None, # Can be used to override defaults above
+    intrinsic_bounds_config: dict = None, 
     debug_opt_data_vis_params: dict = None
 ):
-    logging.info("--- Starting STAGED Extrinsics, Intrinsics, and Timestamp Refinement ---")
-    global de_eval_count_global # Reset for accurate counting per run if needed
+    logging.info("--- Starting STAGED Extrinsics, Intrinsics, and Timestamp Refinement (Fixed Global Target Version) ---")
+    global de_eval_count_global
     de_eval_count_global = 0
 
-    # --- Initial Parameter Setup (common) ---
     num_query_images_for_opt = len(query_indices_for_opt)
-    if num_query_images_for_opt == 0: # Should be pre-filtered by caller
+    if num_query_images_for_opt == 0:
         logging.error("No query images for staged refinement."); return None, None, None, None, None
 
     num_d_params = 0
-    flat_initial_D_sensor = np.array([])
-    if initial_D_sensor_coeffs is not None:
-        flat_initial_D_sensor = initial_D_sensor_coeffs.flatten()
-        num_d_params = len(flat_initial_D_sensor)
+    flat_initial_D_sensor_cfg = np.array([])
+    if initial_D_sensor_coeffs_cfg is not None:
+        flat_initial_D_sensor_cfg = initial_D_sensor_coeffs_cfg.flatten()
+        num_d_params = len(flat_initial_D_sensor_cfg)
 
-    initial_k_params_ideal = np.array([
-        K_initial_ideal_for_undistorted_input[0, 0], K_initial_ideal_for_undistorted_input[1, 1],
-        K_initial_ideal_for_undistorted_input[0, 2], K_initial_ideal_for_undistorted_input[1, 2]
+    # This is K_sensor from config, used as initial guess for Stage 2 DE & final LS, and for global target gen
+    initial_k_params_sensor_cfg = np.array([
+        K_initial_sensor_cfg[0, 0], K_initial_sensor_cfg[1, 1],
+        K_initial_sensor_cfg[0, 2], K_initial_sensor_cfg[1, 2]
     ])
     
     ego_interpolator_func = functools.partial(get_pose_for_timestamp,
@@ -3457,25 +3427,58 @@ def refine_all_parameters_staged( # New name for the staged approach
                                             poses=ego_poses,
                                             tolerance_us=interpolation_tolerance_us)
 
+    # --- Pre-calculate GLOBAL fixed target points based on initial sensor config ---
+    precalculated_target_distorted_points_map_GLOBAL = {}
+    logging.info("Pre-calculating GLOBAL fixed target distorted points for all DE/LS stages...")
+    # Debug visualization for these global targets
+    global_target_vis_dir = None
+    if debug_opt_data_vis_params and debug_opt_data_vis_params.get('output_vis_dir_base'):
+        global_target_vis_dir = Path(debug_opt_data_vis_params['output_vis_dir_base']) / "GLOBAL_fixed_targets_debug"
+        global_target_vis_dir.mkdir(parents=True, exist_ok=True)
+
+    for img_idx in query_indices_for_opt:
+        p2d_undist_ideal_kps_img, _ = inlier_matches_map_undistorted_ideal[img_idx]
+        if p2d_undist_ideal_kps_img.shape[0] == 0:
+            precalculated_target_distorted_points_map_GLOBAL[img_idx] = np.empty((0,2), dtype=np.float64)
+            continue
+        
+        targets = generate_target_distorted_points(
+            p2d_undistorted_pixels=p2d_undist_ideal_kps_img,
+            K_sensor_current=K_initial_sensor_cfg,          # Use initial configured sensor K
+            D_sensor_current=initial_D_sensor_coeffs_cfg,   # Use initial configured sensor D
+            model_type=model_type,
+            K_ideal_fixed_for_normalization=K_ideal_plane_definition, # K defining the ideal plane
+            img_width=img_width,
+            img_height=img_height
+        )
+        precalculated_target_distorted_points_map_GLOBAL[img_idx] = targets
+        
+        if global_target_vis_dir and \
+           debug_opt_data_vis_params.get('image_idx_to_name_map') and \
+           debug_opt_data_vis_params.get('query_image_dir') and \
+           img_idx in debug_opt_data_vis_params.get('vis_image_indices_global_targets', []): # New key for these
+            
+            image_filename = debug_opt_data_vis_params['image_idx_to_name_map'].get(img_idx)
+            if image_filename:
+                original_image_file_path_str = str(Path(debug_opt_data_vis_params['query_image_dir']) / image_filename)
+                if Path(original_image_file_path_str).exists():
+                    vis_path_str = str(global_target_vis_dir / f"GLOBAL_target_img_{img_idx}_{Path(image_filename).stem}.png")
+                    logging.info(f"DEBUG VIS (Global Target): Visualizing for img_idx {img_idx} to {vis_path_str}")
+                    visualize_2d_points_on_image(
+                        original_image_path=original_image_file_path_str, points_2d_to_draw=targets.copy(),
+                        output_path=vis_path_str, label=f"GLOBAL Fixed Target (idx {img_idx})", point_color=(0, 128, 255)
+                    )
+    # --- End Pre-calculation ---
+
     # --- STAGE 1: Optimize T_ego_cam (Extrinsics) using DE ---
     logging.info("\n--- STAGE 1: Optimizing T_ego_cam (Extrinsics) with DE ---")
-    
-    # Determine T_ego_cam to center Stage 1 DE search around
     T_ego_cam_stage1_center = initial_T_ego_cam_from_config
-    # if pnp_derived_T_ego_cam_guess is not None:
-    #     try:
-    #         if np.isclose(np.linalg.det(pnp_derived_T_ego_cam_guess[:3,:3]), 1.0):
-    #             T_ego_cam_stage1_center = pnp_derived_T_ego_cam_guess
-    #             logging.info("Using PnP-derived T_ego_cam as center for Stage 1 DE search.")
-    #         else:
-    #             logging.warning("PnP-derived T_ego_cam invalid. Using config T_ego_cam for Stage 1 DE center.")
-    #     except: logging.warning("Error with PnP T_ego_cam. Using config T_ego_cam for Stage 1 DE center.")
-    
+    # (Optional: use pnp_derived_T_ego_cam_guess to center DE search if valid)
+    # ...
     try:
         xi_ego_cam_stage1_initial_center = SE3_to_se3(T_ego_cam_stage1_center)
     except:
-        logging.error("Failed to convert T_ego_cam_stage1_center to se3. Using zeros.")
-        xi_ego_cam_stage1_initial_center = np.zeros(6)
+        logging.error("Failed to convert T_ego_cam_stage1_center to se3. Using zeros."); xi_ego_cam_stage1_initial_center = np.zeros(6)
 
     bounds_stage1_xi_low = xi_ego_cam_stage1_initial_center - stage1_de_xi_bounds_abs_offset
     bounds_stage1_xi_high = xi_ego_cam_stage1_initial_center + stage1_de_xi_bounds_abs_offset
@@ -3486,28 +3489,20 @@ def refine_all_parameters_staged( # New name for the staged approach
         "query_indices_for_opt": query_indices_for_opt,
         "query_timestamps_rec_us": query_timestamps_rec_us,
         "ego_interpolator_us": ego_interpolator_func,
-        "K_initial_ideal_for_undistorted_input": K_initial_ideal_for_undistorted_input,
         "model_type": model_type, "img_width": img_width, "img_height": img_height,
-        # Fixed intrinsics for Stage 1 (using the initial config/ideal values)
-        "K_sensor_fixed": K_initial_ideal_for_undistorted_input.copy(),
-        "D_sensor_fixed": initial_D_sensor_coeffs.copy() if initial_D_sensor_coeffs is not None else np.array([]),
-        "de_robust_loss_type": de_robust_loss_type,
-        "de_robust_loss_scale": de_robust_loss_scale,
+        "precalculated_target_distorted_points_map_GLOBAL": precalculated_target_distorted_points_map_GLOBAL,
+        "K_sensor_for_projection_in_stage1": K_initial_sensor_cfg.copy(), # K for projection matches target gen K
+        "D_sensor_for_projection_in_stage1": initial_D_sensor_coeffs_cfg.copy() if initial_D_sensor_coeffs_cfg is not None else np.array([]),
+        "de_robust_loss_type": de_robust_loss_type, "de_robust_loss_scale": de_robust_loss_scale,
         "de_popsize_factor_for_log": stage1_de_popsize_factor
     }
-
-    logging.info(f"Stage 1 DE: Optimizing {len(de_bounds_stage1)} extrinsic parameters.")
-    logging.info(f"Stage 1 DE using fixed K_sensor:\n{objective_data_dict_stage1['K_sensor_fixed']}")
-    logging.info(f"Stage 1 DE using fixed D_sensor: {objective_data_dict_stage1['D_sensor_fixed']}")
-
+    # ... (DE call for Stage 1 remains same, using de_objective_func_stage1_extrinsics_only)
     de_result_stage1 = differential_evolution(
-        de_objective_func_stage1_extrinsics_only,
-        bounds=de_bounds_stage1,
-        args=(objective_data_dict_stage1,),
-        strategy='best1bin', maxiter=stage1_de_maxiter, popsize=stage1_de_popsize_factor,
-        tol=0.001, polish=False, disp=True, workers=de_workers, updating='deferred'
+        de_objective_func_stage1_extrinsics_only, bounds=de_bounds_stage1,
+        args=(objective_data_dict_stage1,), strategy='best1bin', maxiter=stage1_de_maxiter,
+        popsize=stage1_de_popsize_factor, tol=0.001, polish=False, disp=True,
+        workers=de_workers, updating='deferred'
     )
-    
     if not de_result_stage1.success:
         logging.warning(f"Stage 1 DE (Extrinsics) did not converge: {de_result_stage1.message}. Using its best found parameters.")
     xi_ego_cam_from_stage1 = de_result_stage1.x
@@ -3515,35 +3510,30 @@ def refine_all_parameters_staged( # New name for the staged approach
     logging.info(f"Stage 1 DE (Extrinsics) finished. Cost: {de_result_stage1.fun:.6e}")
     logging.info(f"T_ego_cam from Stage 1:\n{np.round(T_ego_cam_from_stage1, 5)}")
 
+
     # --- STAGE 2: Optimize K_sensor, D_sensor (Intrinsics) using DE, with T_ego_cam fixed ---
     logging.info("\n--- STAGE 2: Optimizing K_sensor, D_sensor (Intrinsics) with DE (fixed T_ego_cam) ---")
-    
-    # Bounds for K (relative to initial K_ideal)
-    k_s2_low = initial_k_params_ideal * stage2_de_k_bounds_rel_offset[0]
-    k_s2_high = initial_k_params_ideal * stage2_de_k_bounds_rel_offset[1]
-    # Bounds for cx, cy (absolute offset from initial K_ideal)
-    k_s2_low[2] = initial_k_params_ideal[2] - stage2_de_cxcy_bounds_abs_offset_px
-    k_s2_high[2] = initial_k_params_ideal[2] + stage2_de_cxcy_bounds_abs_offset_px
-    k_s2_low[3] = initial_k_params_ideal[3] - stage2_de_cxcy_bounds_abs_offset_px
-    k_s2_high[3] = initial_k_params_ideal[3] + stage2_de_cxcy_bounds_abs_offset_px
-    # Ensure cx,cy bounds are valid
+    # Bounds for K (relative to initial K_sensor_cfg)
+    k_s2_low = initial_k_params_sensor_cfg * stage2_de_k_bounds_rel_offset[0]
+    k_s2_high = initial_k_params_sensor_cfg * stage2_de_k_bounds_rel_offset[1]
+    # ... (cx, cy, D bounds setup remains same, using flat_initial_D_sensor_cfg)
+    k_s2_low[2] = initial_k_params_sensor_cfg[2] - stage2_de_cxcy_bounds_abs_offset_px
+    k_s2_high[2] = initial_k_params_sensor_cfg[2] + stage2_de_cxcy_bounds_abs_offset_px
+    k_s2_low[3] = initial_k_params_sensor_cfg[3] - stage2_de_cxcy_bounds_abs_offset_px
+    k_s2_high[3] = initial_k_params_sensor_cfg[3] + stage2_de_cxcy_bounds_abs_offset_px
     k_s2_low[2] = max(0, k_s2_low[2]); k_s2_high[2] = min(img_width -1, k_s2_high[2])
     k_s2_low[3] = max(0, k_s2_low[3]); k_s2_high[3] = min(img_height -1, k_s2_high[3])
 
-    # Bounds for D (absolute offset from initial D_sensor)
     d_s2_low, d_s2_high = np.array([]), np.array([])
     if num_d_params > 0:
         d_offset = stage2_de_d_bounds_abs_offset
-        if d_offset is None: # Default if not provided
-            if model_type == "KANNALA_BRANDT": d_offset = np.array([0.05, 0.03, 0.01, 0.01])
-            elif model_type == "PINHOLE" and num_d_params >=4 : d_offset = np.array([0.1, 0.05, 0.005, 0.005]) # for k1,k2,p1,p2
+        if d_offset is None: 
+            if model_type == "KANNALA_BRANDT": d_offset = np.array([0.05, 0.03, 0.01, 0.01])[:num_d_params]
+            elif model_type == "PINHOLE": d_offset = np.array([0.1, 0.05, 0.005, 0.005, 0.05])[:num_d_params]
             else: d_offset = np.full(num_d_params, 0.02)
-        
-        # Ensure d_offset has correct length for flat_initial_D_sensor
-        d_offset_corrected = np.resize(d_offset, flat_initial_D_sensor.shape)
-
-        d_s2_low = flat_initial_D_sensor - d_offset_corrected
-        d_s2_high = flat_initial_D_sensor + d_offset_corrected
+        d_offset_corrected = np.resize(d_offset, flat_initial_D_sensor_cfg.shape)
+        d_s2_low = flat_initial_D_sensor_cfg - d_offset_corrected
+        d_s2_high = flat_initial_D_sensor_cfg + d_offset_corrected
 
     de_bounds_stage2_list = list(zip(np.concatenate((k_s2_low, d_s2_low)),
                                      np.concatenate((k_s2_high, d_s2_high))))
@@ -3553,50 +3543,38 @@ def refine_all_parameters_staged( # New name for the staged approach
         "query_indices_for_opt": query_indices_for_opt,
         "query_timestamps_rec_us": query_timestamps_rec_us,
         "ego_interpolator_us": ego_interpolator_func,
-        "K_initial_ideal_for_undistorted_input": K_initial_ideal_for_undistorted_input,
         "model_type": model_type, "img_width": img_width, "img_height": img_height,
         "num_d_params": num_d_params,
-        "T_ego_cam_fixed": T_ego_cam_from_stage1.copy(), # Use result from Stage 1
-        "de_robust_loss_type": de_robust_loss_type,
-        "de_robust_loss_scale": de_robust_loss_scale,
+        "T_ego_cam_fixed": T_ego_cam_from_stage1.copy(),
+        "precalculated_target_distorted_points_map_GLOBAL": precalculated_target_distorted_points_map_GLOBAL,
+        "de_robust_loss_type": de_robust_loss_type, "de_robust_loss_scale": de_robust_loss_scale,
         "de_popsize_factor_for_log": stage2_de_popsize_factor
     }
-    
-    logging.info(f"Stage 2 DE: Optimizing {len(de_bounds_stage2_list)} intrinsic parameters.")
-    logging.info(f"Stage 2 DE using fixed T_ego_cam:\n{objective_data_dict_stage2['T_ego_cam_fixed']}")
-
+    # ... (DE call for Stage 2 remains same, using de_objective_func_stage2_intrinsics_only)
     de_result_stage2 = differential_evolution(
-        de_objective_func_stage2_intrinsics_only,
-        bounds=de_bounds_stage2_list,
-        args=(objective_data_dict_stage2,),
-        strategy='best1bin', maxiter=stage2_de_maxiter, popsize=stage2_de_popsize_factor,
-        tol=0.001, polish=False, disp=True, workers=de_workers, updating='deferred'
+        de_objective_func_stage2_intrinsics_only, bounds=de_bounds_stage2_list,
+        args=(objective_data_dict_stage2,), strategy='best1bin', maxiter=stage2_de_maxiter,
+        popsize=stage2_de_popsize_factor, tol=0.001, polish=False, disp=True,
+        workers=de_workers, updating='deferred'
     )
-
     if not de_result_stage2.success:
         logging.warning(f"Stage 2 DE (Intrinsics) did not converge: {de_result_stage2.message}. Using its best found parameters.")
-    
     intrinsics_params_from_stage2 = de_result_stage2.x
     k_params_from_stage2 = intrinsics_params_from_stage2[:NUM_K_PARAMS]
     d_params_from_stage2 = intrinsics_params_from_stage2[NUM_K_PARAMS : NUM_K_PARAMS + num_d_params]
-    
     K_sensor_from_stage2 = np.array([[k_params_from_stage2[0], 0, k_params_from_stage2[2]],
-                                     [0, k_params_from_stage2[1], k_params_from_stage2[3]],
-                                     [0, 0, 1]])
-    D_sensor_from_stage2 = d_params_from_stage2 # Already flat
-
+                                     [0, k_params_from_stage2[1], k_params_from_stage2[3]], [0,0,1]])
+    D_sensor_from_stage2 = d_params_from_stage2 
     logging.info(f"Stage 2 DE (Intrinsics) finished. Cost: {de_result_stage2.fun:.6e}")
     logging.info(f"K_sensor from Stage 2:\n{np.round(K_sensor_from_stage2, 4)}")
     logging.info(f"D_sensor from Stage 2: {np.round(D_sensor_from_stage2, 6)}")
 
 
     # --- STAGE 3: Final Joint Refinement (LS of T_ego_cam, K, D, and all dt_i) ---
-    # This part is largely similar to the final LS in the original refine_all_parameters_hybrid
-    # but initialized with results from Stage 1 (T_ego_cam) and Stage 2 (K, D).
-    # The dt values will be initialized to 0 or re-calculated based on Stage 1 & 2 results.
     logging.info("\n--- STAGE 3: Final Joint Refinement (T_ego_cam, K, D, dt_i) with Least Squares ---")
-
     # Initialize dt_i based on T_ego_cam_from_stage1 and K/D_from_stage2
+    # For dt calculation, the "target" (p2d_target_dist_final_ls_init) should be based on K_sensor_from_stage2, D_sensor_from_stage2.
+    # However, for the final LS itself, OptimizationData will use the GLOBAL fixed target.
     logging.info("Calculating optimal dt_i values based on Stage 1 & 2 results for final LS initialization...")
     dt_init_for_final_ls_map = {}
     for img_idx in query_indices_for_opt:
@@ -3604,54 +3582,55 @@ def refine_all_parameters_staged( # New name for the staged approach
         if p2d_undist_ideal_kps_img.shape[0] == 0:
             dt_init_for_final_ls_map[img_idx] = 0.0; continue
         t_rec_us_img = query_timestamps_rec_us[img_idx]
-        p2d_target_dist_final_ls_init = generate_target_distorted_points(
-            p2d_undist_ideal_kps_img, K_sensor_from_stage2, D_sensor_from_stage2,
-            model_type, K_initial_ideal_for_undistorted_input, img_width, img_height
+        
+        # Generate target for dt optimization using Stage 2 K/D results
+        p2d_target_for_dt_opt = generate_target_distorted_points(
+            p2d_undist_ideal_kps_img, 
+            K_sensor_current=K_sensor_from_stage2,       # K from Stage 2
+            D_sensor_current=D_sensor_from_stage2,       # D from Stage 2
+            model_type=model_type, 
+            K_ideal_fixed_for_normalization=K_ideal_plane_definition, 
+            img_width=img_width, img_height=img_height
         )
-        if p2d_target_dist_final_ls_init.shape[0] == 0:
+        if p2d_target_for_dt_opt.shape[0] == 0:
             dt_init_for_final_ls_map[img_idx] = 0.0; continue
 
-        # Inner LS for dt uses 'linear' loss
         dt_opt_s, _, _, _, _ = refine_timestamp_only_revised_for_de(
             T_ego_cam_from_stage1, K_sensor_from_stage2, D_sensor_from_stage2, model_type,
             img_width, img_height,
-            p2d_target_dist_final_ls_init, P3d_world_img, t_rec_us_img,
+            p2d_target_for_dt_opt, # Target based on K/D from Stage 2
+            P3d_world_img, t_rec_us_img,
             ego_interpolator_func,
-            dt_bounds_seconds=dt_bounds_seconds_final_ls, # Use final LS dt bounds here
-            loss_function='linear' 
+            dt_bounds_seconds=dt_bounds_seconds_final_ls, loss_function='linear' 
         )
         dt_init_for_final_ls_map[img_idx] = dt_opt_s if dt_opt_s is not None else 0.0
     
-    # Create OptimizationData for the final LS step
-    # It uses K_sensor_from_stage2 and D_sensor_from_stage2 as its "initial" K and D
-    # for generating its internal p2d_target_distorted points.
-    try:
-        opt_data_final_ls = OptimizationData(
-            inlier_matches_map_us=inlier_matches_map_undistorted_ideal,
-            ego_interpolator_us=ego_interpolator_func,
-            K_initial_ideal=K_sensor_from_stage2, # Initial K for OptData is from Stage 2
-            D_initial_sensor=D_sensor_from_stage2, # Initial D for OptData is from Stage 2
-            model_type=model_type,
-            img_width=img_width, img_height=img_height,
-            t_rec_map_us=query_timestamps_rec_us,
-            num_images_passed_to_constructor=len(query_indices_for_opt),
-            debug_image_idx_to_name_map=debug_opt_data_vis_params.get('image_idx_to_name_map') if debug_opt_data_vis_params else None,
-            debug_query_image_dir=debug_opt_data_vis_params.get('query_image_dir') if debug_opt_data_vis_params else None,
-            debug_output_vis_dir=debug_opt_data_vis_params.get('output_vis_dir') if debug_opt_data_vis_params else None,
-            debug_vis_image_indices=debug_opt_data_vis_params.get('vis_image_indices') if debug_opt_data_vis_params else []
-        )
-    except Exception as e_optdata:
-        logging.error(f"Failed to create OptimizationData for Stage 3 LS: {e_optdata}", exc_info=True)
-        return T_ego_cam_from_stage1, K_sensor_from_stage2, D_sensor_from_stage2, dt_init_for_final_ls_map, None # Return Stage 1&2 results
-
-    if opt_data_final_ls.num_opt_images == 0:
+    # Create OptimizationData for the final LS step.
+    # Its internal targets will be the GLOBAL fixed targets.
+    opt_data_final_ls = OptimizationData(
+        inlier_matches_map_us=inlier_matches_map_undistorted_ideal,
+        ego_interpolator_us=ego_interpolator_func,
+        K_initial_ideal_for_opt_data_targets=K_initial_sensor_cfg, # For OptData's internal target gen
+        D_initial_sensor_for_opt_data_targets=initial_D_sensor_coeffs_cfg, # For OptData's internal target gen
+        model_type=model_type,
+        img_width=img_width, img_height=img_height,
+        t_rec_map_us=query_timestamps_rec_us,
+        num_images_passed_to_constructor=len(query_indices_for_opt),
+        K_GLOBAL_IDEAL_FOR_UNDIST_NORMALIZATION=K_ideal_plane_definition, # K_ideal plane
+        debug_image_idx_to_name_map=debug_opt_data_vis_params.get('image_idx_to_name_map') if debug_opt_data_vis_params else None,
+        debug_query_image_dir=debug_opt_data_vis_params.get('query_image_dir') if debug_opt_data_vis_params else None,
+        debug_output_vis_dir= (Path(debug_opt_data_vis_params['output_vis_dir_base']) / "LS_OptData_targets_debug_staged") if debug_opt_data_vis_params and debug_opt_data_vis_params.get('output_vis_dir_base') else None,
+        debug_vis_image_indices=debug_opt_data_vis_params.get('vis_image_indices_final_ls_optdata', []) if debug_opt_data_vis_params else []
+    )
+    # ... (LS initial guess x0, bounds, and call remain mostly the same,
+    #      initialized with T_ego_cam_from_stage1, K_sensor_from_stage2, D_sensor_from_stage2)
+    if opt_data_final_ls.num_opt_images == 0: # Should be caught earlier by query_indices_for_opt check
         logging.error("OptData for Stage 3 LS has zero images. Returning Stage 1 & 2 results.")
         return T_ego_cam_from_stage1, K_sensor_from_stage2, D_sensor_from_stage2, dt_init_for_final_ls_map, None
 
-    # Initial guess for final LS
-    xi_ego_cam_ls_init = xi_ego_cam_from_stage1 # From Stage 1
-    k_params_ls_init = k_params_from_stage2   # From Stage 2
-    d_params_ls_init = D_sensor_from_stage2   # From Stage 2 (already flat)
+    xi_ego_cam_ls_init = xi_ego_cam_from_stage1 
+    k_params_ls_init = k_params_from_stage2   
+    d_params_ls_init = D_sensor_from_stage2   
     
     dt_ls_init_seconds_vec = np.zeros(opt_data_final_ls.num_opt_images)
     for i, img_idx_in_opt_data in enumerate(opt_data_final_ls.image_indices):
@@ -3662,7 +3641,7 @@ def refine_all_parameters_staged( # New name for the staged approach
     # Bounds for final LS (tighter, around Stage 1/2 results)
     bounds_ls_low = list(xi_ego_cam_ls_init - final_ls_xi_bounds_abs_offset)
     bounds_ls_high = list(xi_ego_cam_ls_init + final_ls_xi_bounds_abs_offset)
-
+    # K bounds
     k_ls_b_low = k_params_ls_init * final_ls_k_bounds_rel_offset[0]
     k_ls_b_high = k_params_ls_init * final_ls_k_bounds_rel_offset[1]
     k_ls_b_low[2] = k_params_ls_init[2] - final_ls_cxcy_bounds_abs_offset_px
@@ -3671,9 +3650,8 @@ def refine_all_parameters_staged( # New name for the staged approach
     k_ls_b_high[3] = k_params_ls_init[3] + final_ls_cxcy_bounds_abs_offset_px
     k_ls_b_low[2] = max(0,k_ls_b_low[2]); k_ls_b_high[2] = min(img_width-1,k_ls_b_high[2])
     k_ls_b_low[3] = max(0,k_ls_b_low[3]); k_ls_b_high[3] = min(img_height-1,k_ls_b_high[3])
-    bounds_ls_low.extend(k_ls_b_low)
-    bounds_ls_high.extend(k_ls_b_high)
-
+    bounds_ls_low.extend(k_ls_b_low); bounds_ls_high.extend(k_ls_b_high)
+    # D bounds
     if num_d_params > 0:
         d_abs = np.abs(d_params_ls_init)
         d_ls_b_low = list(d_params_ls_init - final_ls_d_bounds_abs_offset_scale * d_abs - final_ls_d_bounds_abs_offset_const)
@@ -3682,72 +3660,60 @@ def refine_all_parameters_staged( # New name for the staged approach
             if d_ls_b_low[i_d] >= d_ls_b_high[i_d]:
                 d_mid = (d_ls_b_low[i_d] + d_ls_b_high[i_d])/2.0
                 d_ls_b_low[i_d] = d_mid - 1e-4; d_ls_b_high[i_d] = d_mid + 1e-4
-        bounds_ls_low.extend(d_ls_b_low)
-        bounds_ls_high.extend(d_ls_b_high)
-    
+        bounds_ls_low.extend(d_ls_b_low); bounds_ls_high.extend(d_ls_b_high)
+    # dt bounds
     bounds_ls_low.extend([dt_bounds_seconds_final_ls[0]] * opt_data_final_ls.num_opt_images)
     bounds_ls_high.extend([dt_bounds_seconds_final_ls[1]] * opt_data_final_ls.num_opt_images)
     bounds_final_ls_staged = (bounds_ls_low, bounds_ls_high)
 
-    # f_scale for robust loss in final LS
-    f_scale_final_ls = de_robust_loss_scale # Use the same scale as DE stages, or make it a new param
-
+    f_scale_final_ls = de_robust_loss_scale 
     try:
         initial_final_ls_residuals = compute_residuals(x0_final_ls, opt_data_final_ls)
         initial_final_ls_cost_robust = calculate_robust_cost_for_de(
             initial_final_ls_residuals, loss_function_final_ls, f_scale_final_ls
         )
-        logging.info(f"Stage 3 LS: Initial cost (from Stage 1&2, robust '{loss_function_final_ls}' eval, scale={f_scale_final_ls}): {initial_final_ls_cost_robust:.4e}")
+        logging.info(f"Stage 3 LS: Initial cost (robust '{loss_function_final_ls}' eval, scale={f_scale_final_ls}): {initial_final_ls_cost_robust:.4e}")
     except Exception as e_ls_init_cost:
         logging.error(f"Failed to compute initial cost for Stage 3 LS: {e_ls_init_cost}. Returning Stage 1&2 results.", exc_info=True)
         return T_ego_cam_from_stage1, K_sensor_from_stage2, D_sensor_from_stage2, dt_init_for_final_ls_map, None
-
+    
     final_ls_result_obj = None
     try:
         final_ls_result_obj = least_squares(
             compute_residuals, x0_final_ls, jac='2-point', bounds=bounds_final_ls_staged, method='trf',
-            ftol=1e-9, xtol=1e-9, gtol=1e-9, # Strict tolerances for final stage
-            loss=loss_function_final_ls, f_scale=f_scale_final_ls,
-            verbose=final_ls_verbose,
-            max_nfev=2500 * len(x0_final_ls), # Allow more evaluations for final tuning
-            args=(opt_data_final_ls,)
+            ftol=1e-9, xtol=1e-9, gtol=1e-9, loss=loss_function_final_ls, f_scale=f_scale_final_ls,
+            verbose=final_ls_verbose, max_nfev=2500 * len(x0_final_ls), args=(opt_data_final_ls,)
         )
         logging.info(f"Stage 3 LS optimization finished. Status: {final_ls_result_obj.status} ({final_ls_result_obj.message})")
-        logging.info(f"Stage 3 LS cost (using '{loss_function_final_ls}' with f_scale={f_scale_final_ls}): {final_ls_result_obj.cost:.4e}. Optimality: {final_ls_result_obj.optimality:.4e}")
+        logging.info(f"Stage 3 LS cost: {final_ls_result_obj.cost:.4e}. Optimality: {final_ls_result_obj.optimality:.4e}")
     except Exception as e_ls_final:
         logging.error(f"Stage 3 LS optimization crashed: {e_ls_final}. Returning Stage 1&2 results.", exc_info=True)
         return T_ego_cam_from_stage1, K_sensor_from_stage2, D_sensor_from_stage2, dt_init_for_final_ls_map, None
 
     # --- Unpack Final Results from Stage 3 LS ---
-    # Default to Stage 1/2 results if LS fails or doesn't improve
     T_ego_cam_final_staged = T_ego_cam_from_stage1
     K_sensor_final_staged = K_sensor_from_stage2
     D_sensor_final_staged = D_sensor_from_stage2
     final_refined_delta_t_map_seconds_staged = dt_init_for_final_ls_map
 
-    if final_ls_result_obj and (final_ls_result_obj.success or final_ls_result_obj.cost < initial_final_ls_cost_robust):
+    if final_ls_result_obj and (final_ls_result_obj.success or final_ls_result_obj.cost < initial_final_ls_cost_robust * 0.999): # Allow tiny increase if success flag is good
         X_ls_final = final_ls_result_obj.x
         T_ego_cam_final_staged = se3_to_SE3(X_ls_final[:6])
         k_final_params = X_ls_final[6:6+NUM_K_PARAMS]
         K_sensor_final_staged = np.array([[k_final_params[0], 0, k_final_params[2]],
-                                          [0, k_final_params[1], k_final_params[3]],
-                                          [0,0,1]])
+                                          [0, k_final_params[1], k_final_params[3]], [0,0,1]])
         D_sensor_final_staged = X_ls_final[6+NUM_K_PARAMS : 6+NUM_K_PARAMS+num_d_params]
-        
         dt_final_seconds_flat = X_ls_final[6+NUM_K_PARAMS+num_d_params:]
-        # final_refined_delta_t_map_seconds_staged already initialized, update it
         for i, img_idx_in_opt_data in enumerate(opt_data_final_ls.image_indices):
             if img_idx_in_opt_data in final_refined_delta_t_map_seconds_staged:
                  final_refined_delta_t_map_seconds_staged[img_idx_in_opt_data] = dt_final_seconds_flat[i]
         logging.info("Successfully refined all parameters using 3-Stage optimization (DE-Extr -> DE-Intr -> LS-Joint).")
     else:
-        logging.warning("Stage 3 LS did not improve upon Stage 1&2 results or failed. Returning Stage 1&2 parameters with LS-initialized dt.")
+        logging.warning(f"Stage 3 LS did not improve upon Stage 1&2 results (Cost DE/S2: {initial_final_ls_cost_robust:.4e} vs LS: {final_ls_result_obj.cost:.4e if final_ls_result_obj else 'N/A'}) or failed. Returning Stage 1&2 parameters with LS-initialized dt.")
 
-    # Log final parameters
     logging.info(f"Final Refined T_ego_cam (Staged):\n{np.round(T_ego_cam_final_staged, 6)}")
     logging.info(f"Final Refined K_sensor (Staged):\n{np.round(K_sensor_final_staged, 4)}")
-    if num_d_params > 0:
-        logging.info(f"Final Refined D_sensor (Staged):\n{np.round(D_sensor_final_staged, 7)}")
+    if num_d_params > 0: logging.info(f"Final Refined D_sensor (Staged):\n{np.round(D_sensor_final_staged, 7)}")
 
     return T_ego_cam_final_staged, K_sensor_final_staged, D_sensor_final_staged, final_refined_delta_t_map_seconds_staged, final_ls_result_obj
 
@@ -4043,329 +4009,420 @@ def refine_parameters_de_extr_then_ls_joint(
 
     return T_ego_cam_final_refined, K_sensor_final_refined, D_sensor_final_refined, final_refined_delta_t_map, final_ls_result_obj
 
-# --- Hybrid Refinement Function ---
 def refine_all_parameters_hybrid(
+    # Config and Initial State
     initial_T_ego_cam_from_config: np.ndarray,
     pnp_derived_T_ego_cam_guess: np.ndarray,
-    inlier_matches_map_undistorted_ideal: dict,
+    # Data: PnP inliers (ideal plane) and corresponding 3D world points
+    # This map contains ALL PnP successful matches before spatial distribution.
+    inlier_matches_map_undistorted_ideal_ALL_PNP_SUCCESS: dict,
     ego_timestamps_us: np.ndarray,
     ego_poses: list,
-    query_indices_for_opt: list,
-    query_timestamps_rec_us: dict,
-    K_initial_ideal_for_undistorted_input: np.ndarray,
-    initial_D_sensor_coeffs: np.ndarray,
+    # query_indices_for_opt_ALL_PNP_SUCCESS: List of image indices that had *any* PnP success
+    query_indices_for_opt_ALL_PNP_SUCCESS: list,
+    query_timestamps_rec_us: dict, # Full map {img_idx: t_rec_us}
+    # Sensor model parameters
+    K_ideal_plane_definition: np.ndarray, # K defining the ideal undistorted plane
+    K_initial_sensor_cfg: np.ndarray, # Initial K of the physical sensor (from config)
+    initial_D_sensor_coeffs_cfg: np.ndarray, # Initial D of the physical sensor (from config)
     model_type: str,
     img_width: int, img_height: int,
+    # DE Parameters
     dt_bounds_seconds_de_inner_opt: tuple[float, float] = (-0.02, 0.02),
-    dt_bounds_seconds_final_ls: tuple[float, float] = (-0.05, 0.05),
-    # --- Robust Loss Parameters ---
-    de_robust_loss_type: str = 'cauchy',         # Robust loss for DE objective
-    de_robust_loss_scale: float = 5.0,           # Scale for DE robust loss (e.g., pixel error)
-    loss_function_final_ls: str = 'cauchy',      # Robust loss for final least_squares
-    # --- End Robust Loss Parameters ---
-    final_ls_verbose: int = 1,
-    interpolation_tolerance_us: int = 1,
-    intrinsic_bounds_config: dict = None,
+    de_robust_loss_type: str = 'cauchy',
+    de_robust_loss_scale: float = 5.0,
     de_popsize_factor: int = 15,
     de_maxiter: int = 150,
     de_workers: int = -1,
+    # Final LS Parameters
+    dt_bounds_seconds_final_ls: tuple[float, float] = (-0.05, 0.05),
+    loss_function_final_ls: str = 'cauchy',
+    final_ls_verbose: int = 1,
+    # Bounds Configuration (passed via intrinsic_bounds_config)
+    interpolation_tolerance_us: int = 1,
+    intrinsic_bounds_config: dict = None, # Contains DE and LS bounds details
+    # Spatial Distribution Parameters
+    spatial_distribution_grid_size: int = 10,
+    max_points_per_grid_cell: int = 2,
+    min_total_distributed_points: int = 100,
+    # Debug Visualization Parameters
     debug_opt_data_vis_params: dict = None
 ):
-    logging.info("--- Starting HYBRID Extrinsics, Intrinsics, and Timestamp Refinement ---")
+    logging.info("--- Starting HYBRID Extrinsics, Intrinsics, and Timestamp Refinement (Global Spatial Distribution) ---")
     logging.info(f"DE Robust Loss: Type='{de_robust_loss_type}', Scale={de_robust_loss_scale}")
-    logging.info(f"Final LS Robust Loss: Type='{loss_function_final_ls}' (f_scale for LS is internally handled or can be passed via least_squares_kwargs if needed)")
+    logging.info(f"Final LS Robust Loss: Type='{loss_function_final_ls}'")
 
-    # ... (initial setup, num_d_params, T_ego_cam_for_de_center, xi_ego_cam_de_initial, k_params_init_ideal remains the same) ...
-    num_query_images_for_opt = len(query_indices_for_opt)
-    if num_query_images_for_opt == 0:
-        logging.error("No query images provided for hybrid refinement.")
+    global de_eval_count_global
+    de_eval_count_global = 0
+
+    if not query_indices_for_opt_ALL_PNP_SUCCESS:
+        logging.error("No PnP successful query images provided for hybrid refinement.")
         return None, None, None, None, None
 
     num_d_params = 0
-    d_params_init_sensor = np.array([])
-    if initial_D_sensor_coeffs is not None:
-        d_params_init_sensor = initial_D_sensor_coeffs.flatten()
-        num_d_params = len(d_params_init_sensor)
+    flat_initial_D_sensor_cfg = np.array([])
+    if initial_D_sensor_coeffs_cfg is not None:
+        flat_initial_D_sensor_cfg = initial_D_sensor_coeffs_cfg.flatten()
+        num_d_params = len(flat_initial_D_sensor_cfg)
 
     T_ego_cam_for_de_center = initial_T_ego_cam_from_config
-    # if pnp_derived_T_ego_cam_guess is not None:
-    #     try:
-    #         if np.isclose(np.linalg.det(pnp_derived_T_ego_cam_guess[:3,:3]), 1.0):
-    #             T_ego_cam_for_de_center = pnp_derived_T_ego_cam_guess
-    #             logging.info("Using PnP-derived T_ego_cam as center for DE search.")
-    #         else:
-    #             logging.warning("PnP-derived T_ego_cam has invalid determinant. Falling back to config T_ego_cam for DE center.")
-    #     except Exception:
-    #         logging.warning("Error validating PnP-derived T_ego_cam. Falling back to config T_ego_cam for DE center.")
-    # else:
-    #     logging.info("No PnP-derived T_ego_cam provided. Using config T_ego_cam as center for DE search.")
-    
+    if pnp_derived_T_ego_cam_guess is not None:
+        try:
+            if np.isclose(np.linalg.det(pnp_derived_T_ego_cam_guess[:3,:3]), 1.0) and \
+               np.all(np.isfinite(pnp_derived_T_ego_cam_guess)):
+                T_ego_cam_for_de_center = pnp_derived_T_ego_cam_guess
+                logging.info("Using PnP-derived T_ego_cam as center for DE search.")
+        except Exception as e_pnp_val:
+            logging.warning(f"Error validating PnP T_ego_cam guess ({e_pnp_val}), using config T_ego_cam for DE center.")
+
     try:
-        xi_ego_cam_de_initial = SE3_to_se3(T_ego_cam_for_de_center)
+        xi_ego_cam_de_initial_center = SE3_to_se3(T_ego_cam_for_de_center)
     except Exception as e_se3:
         logging.error(f"Failed to convert T_ego_cam_for_de_center to se3: {e_se3}. Using identity for xi initial.")
-        xi_ego_cam_de_initial = np.zeros(6)
+        xi_ego_cam_de_initial_center = np.zeros(6)
 
-    k_params_init_ideal = np.array([
-        K_initial_ideal_for_undistorted_input[0, 0], K_initial_ideal_for_undistorted_input[1, 1],
-        K_initial_ideal_for_undistorted_input[0, 2], K_initial_ideal_for_undistorted_input[1, 2]
+    # K_sensor for DE initial guess (can be same as K_initial_sensor_cfg or K_ideal_plane_definition)
+    k_params_init_sensor_for_DE = np.array([
+        K_initial_sensor_cfg[0, 0], K_initial_sensor_cfg[1, 1],
+        K_initial_sensor_cfg[0, 2], K_initial_sensor_cfg[1, 2]
     ])
 
-    # ... (DE bounds setup: bounds_de_xi_low/high, bounds_de_k_low/high, bounds_de_d_low/high remains the same) ...
-    bounds_de_xi_low = xi_ego_cam_de_initial - np.array([0.1, 0.1, 0.1, 0.2, 0.2, 0.2]) # Example bounds
-    bounds_de_xi_high = xi_ego_cam_de_initial + np.array([0.1, 0.1, 0.1, 0.2, 0.2, 0.2])
+    # --- 1. Pre-calculate GLOBAL fixed target distorted points for ALL PnP successful input points ---
+    # These targets are based on K_initial_sensor_cfg and initial_D_sensor_coeffs_cfg.
+    precalculated_target_distorted_points_map_GLOBAL_ALL_PNP = {}
+    logging.info("Pre-calculating GLOBAL fixed target distorted points for ALL input PnP-successful points...")
 
-    cfg_bounds = intrinsic_bounds_config if intrinsic_bounds_config else {}
-    k_b_low_default = [ max(10.0, k_params_init_ideal[0] * 0.8), max(10.0, k_params_init_ideal[1] * 0.8), 
-                        k_params_init_ideal[2] - 0.15 * img_width, k_params_init_ideal[3] - 0.15 * img_height ]
-    k_b_high_default = [ k_params_init_ideal[0] * 1.2, k_params_init_ideal[1] * 1.2, 
-                         k_params_init_ideal[2] + 0.15 * img_width, k_params_init_ideal[3] + 0.15 * img_height ]
-    bounds_de_k_low = np.array(cfg_bounds.get('k_low', k_b_low_default))
-    bounds_de_k_high = np.array(cfg_bounds.get('k_high', k_b_high_default))
+    # Debug visualization for these global targets
+    global_target_vis_dir = None
+    vis_image_indices_global_targets = []
+    if debug_opt_data_vis_params and debug_opt_data_vis_params.get('output_vis_dir_base'):
+        global_target_vis_dir = Path(debug_opt_data_vis_params['output_vis_dir_base']) / "GLOBAL_fixed_targets_debug"
+        global_target_vis_dir.mkdir(parents=True, exist_ok=True)
+        vis_image_indices_global_targets = debug_opt_data_vis_params.get('vis_image_indices_global_targets', [])
 
-    d_b_low_def, d_b_high_def = [], []
-    if num_d_params > 0: # Default bounds for D, can be overridden by intrinsic_bounds_config
-        if model_type == "KANNALA_BRANDT":
-            # Wider range for DE exploration
-            d_b_low_def  = d_params_init_sensor - np.array([0.15, 0.08, 0.03, 0.03]) 
-            d_b_high_def = d_params_init_sensor + np.array([0.15, 0.08, 0.03, 0.03])
-        elif model_type == "PINHOLE":
-            if num_d_params == 4: # k1,k2,p1,p2
-                 d_b_low_def  = d_params_init_sensor - np.array([0.25, 0.15, 0.008, 0.008])
-                 d_b_high_def = d_params_init_sensor + np.array([0.25, 0.15, 0.008, 0.008])
-            elif num_d_params == 5: # k1,k2,p1,p2,k3
-                 d_b_low_def  = d_params_init_sensor - np.array([0.25, 0.15, 0.008, 0.008, 0.15])
-                 d_b_high_def = d_params_init_sensor + np.array([0.25, 0.15, 0.008, 0.008, 0.15])
-            else: # Generic wide bounds
-                 d_b_low_def  = d_params_init_sensor - 0.3 * np.abs(d_params_init_sensor) - 0.1
-                 d_b_high_def = d_params_init_sensor + 0.3 * np.abs(d_params_init_sensor) + 0.1
-        else: # Fallback
-            d_b_low_def = d_params_init_sensor - 0.15
-            d_b_high_def = d_params_init_sensor + 0.15
-            
-    bounds_de_d_low = np.array(cfg_bounds.get('d_low', d_b_low_def))
-    bounds_de_d_high = np.array(cfg_bounds.get('d_high', d_b_high_def))
-    # Ensure low < high for D bounds
-    for i in range(len(bounds_de_d_low)):
-        if bounds_de_d_low[i] >= bounds_de_d_high[i]:
-            mid_val = (bounds_de_d_low[i] + bounds_de_d_high[i]) / 2.0
-            bounds_de_d_low[i] = mid_val - 0.01 # Ensure a small spread
-            bounds_de_d_high[i] = mid_val + 0.01
+    if not inlier_matches_map_undistorted_ideal_ALL_PNP_SUCCESS:
+        logging.error("Input 'inlier_matches_map_undistorted_ideal_ALL_PNP_SUCCESS' is empty. Cannot proceed.")
+        return initial_T_ego_cam_from_config, K_initial_sensor_cfg, initial_D_sensor_coeffs_cfg, \
+               {idx: 0.0 for idx in query_indices_for_opt_ALL_PNP_SUCCESS}, None
 
-    de_bounds_list = list(zip(np.concatenate((bounds_de_xi_low, bounds_de_k_low, bounds_de_d_low)),
-                              np.concatenate((bounds_de_xi_high, bounds_de_k_high, bounds_de_d_high))))
-    
-    de_objective_data_for_call = {
-        "inlier_matches_map_undistorted_ideal": inlier_matches_map_undistorted_ideal,
-        "query_indices_for_opt": query_indices_for_opt,
+    for img_idx in query_indices_for_opt_ALL_PNP_SUCCESS:
+        if img_idx not in inlier_matches_map_undistorted_ideal_ALL_PNP_SUCCESS:
+            logging.warning(f"Image index {img_idx} listed in query_indices_for_opt_ALL_PNP_SUCCESS but not found in input map. Skipping.")
+            continue
+
+        p2d_undist_ideal_kps_img, _ = inlier_matches_map_undistorted_ideal_ALL_PNP_SUCCESS[img_idx]
+        if p2d_undist_ideal_kps_img.shape[0] == 0:
+            precalculated_target_distorted_points_map_GLOBAL_ALL_PNP[img_idx] = np.empty((0,2), dtype=np.float64)
+            continue
+
+        targets = generate_target_distorted_points(
+            p2d_undistorted_pixels=p2d_undist_ideal_kps_img,
+            K_sensor_current=K_initial_sensor_cfg, # Use initial configured sensor K
+            D_sensor_current=initial_D_sensor_coeffs_cfg, # Use initial configured sensor D
+            model_type=model_type,
+            K_ideal_fixed_for_normalization=K_ideal_plane_definition, # K defining the ideal plane
+            img_width=img_width,
+            img_height=img_height
+        )
+        precalculated_target_distorted_points_map_GLOBAL_ALL_PNP[img_idx] = targets
+
+        if global_target_vis_dir and img_idx in vis_image_indices_global_targets:
+            image_filename = debug_opt_data_vis_params['image_idx_to_name_map'].get(img_idx)
+            if image_filename:
+                original_image_file_path_str = str(Path(debug_opt_data_vis_params['query_image_dir']) / image_filename)
+                if Path(original_image_file_path_str).exists():
+                    vis_path_str = str(global_target_vis_dir / f"GLOBAL_target_img_{img_idx}_{Path(image_filename).stem}.png")
+                    logging.debug(f"DEBUG VIS (Global Target): Visualizing for img_idx {img_idx} to {vis_path_str}")
+                    visualize_2d_points_on_image(
+                        original_image_path=original_image_file_path_str, points_2d_to_draw=targets.copy(),
+                        output_path=vis_path_str, label=f"GLOBAL Fixed Target (idx {img_idx})", point_color=(0, 128, 255)
+                    )
+    logging.info("Finished pre-calculating GLOBAL fixed targets.")
+
+    # --- 2. Grid-Based Spatial Distribution and Subsampling ---
+    logging.info(f"Applying grid-based spatial distribution (Grid: {spatial_distribution_grid_size}x{spatial_distribution_grid_size}, Max/Cell: {max_points_per_grid_cell})...")
+    grid_cells_data = [[[] for _ in range(spatial_distribution_grid_size)] for _ in range(spatial_distribution_grid_size)]
+    cell_pixel_w = img_width / float(spatial_distribution_grid_size)
+    cell_pixel_h = img_height / float(spatial_distribution_grid_size)
+    total_pts_before_sampling = 0
+
+    for img_idx in query_indices_for_opt_ALL_PNP_SUCCESS:
+        if img_idx not in inlier_matches_map_undistorted_ideal_ALL_PNP_SUCCESS or \
+           img_idx not in precalculated_target_distorted_points_map_GLOBAL_ALL_PNP:
+            continue
+
+        p2d_ideals_img, P3Ds_world_img = inlier_matches_map_undistorted_ideal_ALL_PNP_SUCCESS[img_idx]
+        targets_distorted_img = precalculated_target_distorted_points_map_GLOBAL_ALL_PNP[img_idx]
+
+        if p2d_ideals_img.shape[0] != P3Ds_world_img.shape[0] or \
+           p2d_ideals_img.shape[0] != targets_distorted_img.shape[0] or \
+           p2d_ideals_img.shape[0] == 0:
+            if p2d_ideals_img.shape[0] > 0 : # Log only if there were points but mismatch
+                logging.warning(f"Data mismatch or empty arrays for img_idx {img_idx} during spatial distribution. Skipping its points.")
+            continue
+        
+        total_pts_before_sampling += p2d_ideals_img.shape[0]
+        for i in range(p2d_ideals_img.shape[0]):
+            p2d_ideal = p2d_ideals_img[i]
+            col = int(p2d_ideal[0] / cell_pixel_w); row = int(p2d_ideal[1] / cell_pixel_h)
+            col = max(0, min(col, spatial_distribution_grid_size - 1))
+            row = max(0, min(row, spatial_distribution_grid_size - 1))
+            grid_cells_data[row][col].append({
+                "p2d_ideal": p2d_ideal, "P3d_world": P3Ds_world_img[i],
+                "img_idx": img_idx, "target_distorted": targets_distorted_img[i]
+            })
+
+    selected_points_for_de_and_ls = []
+    for r_idx in range(spatial_distribution_grid_size):
+        for c_idx in range(spatial_distribution_grid_size):
+            cell_pts = grid_cells_data[r_idx][c_idx]
+            if not cell_pts: continue
+            if len(cell_pts) > max_points_per_grid_cell:
+                indices_in_cell = np.random.choice(len(cell_pts), max_points_per_grid_cell, replace=False)
+                selected_points_for_de_and_ls.extend([cell_pts[s_idx] for s_idx in indices_in_cell])
+            else:
+                selected_points_for_de_and_ls.extend(cell_pts)
+
+    logging.info(f"Collected {total_pts_before_sampling} points before spatial sampling.")
+    logging.info(f"Selected {len(selected_points_for_de_and_ls)} points after grid-based spatial distribution for DE/LS.")
+
+    if len(selected_points_for_de_and_ls) < min_total_distributed_points:
+        logging.warning(f"Number of spatially distributed points ({len(selected_points_for_de_and_ls)}) "
+                        f"is less than threshold ({min_total_distributed_points}). "
+                        "Optimization might be unstable. Consider adjusting grid/sampling parameters "
+                        "or using all PnP-successful points as a fallback (not implemented here for brevity).")
+        # Fallback: return initial parameters
+        dt_map_fallback = {idx: 0.0 for idx in query_indices_for_opt_ALL_PNP_SUCCESS}
+        return initial_T_ego_cam_from_config, K_initial_sensor_cfg, initial_D_sensor_coeffs_cfg, dt_map_fallback, None
+
+    # --- 3. Reconstruct Data for DE and LS based on selected_points_for_de_and_ls ---
+    inlier_matches_map_SAMPLED = {}
+    precalculated_target_distorted_points_map_SAMPLED = {}
+    for item in selected_points_for_de_and_ls:
+        img_idx = item["img_idx"]
+        if img_idx not in inlier_matches_map_SAMPLED:
+            inlier_matches_map_SAMPLED[img_idx] = ([], [])
+            precalculated_target_distorted_points_map_SAMPLED[img_idx] = []
+        inlier_matches_map_SAMPLED[img_idx][0].append(item["p2d_ideal"])
+        inlier_matches_map_SAMPLED[img_idx][1].append(item["P3d_world"])
+        precalculated_target_distorted_points_map_SAMPLED[img_idx].append(item["target_distorted"])
+
+    for img_idx in inlier_matches_map_SAMPLED.keys():
+        inlier_matches_map_SAMPLED[img_idx] = \
+            (np.array(inlier_matches_map_SAMPLED[img_idx][0]), np.array(inlier_matches_map_SAMPLED[img_idx][1]))
+        precalculated_target_distorted_points_map_SAMPLED[img_idx] = \
+            np.array(precalculated_target_distorted_points_map_SAMPLED[img_idx])
+
+    query_indices_SAMPLED = sorted(list(inlier_matches_map_SAMPLED.keys()))
+    if not query_indices_SAMPLED: # Should be caught by min_total_distributed_points
+        logging.error("No points selected after spatial distribution (empty query_indices_SAMPLED). Cannot proceed.")
+        dt_map_fallback = {idx: 0.0 for idx in query_indices_for_opt_ALL_PNP_SUCCESS}
+        return initial_T_ego_cam_from_config, K_initial_sensor_cfg, initial_D_sensor_coeffs_cfg, dt_map_fallback, None
+
+    # --- 4. DE Optimization (using the spatially distributed sampled data) ---
+    # DE Bounds Setup (Using intrinsic_bounds_config)
+    cfg_b = intrinsic_bounds_config if intrinsic_bounds_config else {}
+    xi_de_abs_offset = np.array(cfg_b.get('de_xi_abs_offset', [0.2,0.2,0.2,0.5,0.5,0.5]))
+    b_de_xi_low = xi_ego_cam_de_initial_center - xi_de_abs_offset
+    b_de_xi_high = xi_ego_cam_de_initial_center + xi_de_abs_offset
+    # K bounds for DE
+    k_de_rel_low = cfg_b.get('de_k_rel_offset_low', 0.8); k_de_rel_high = cfg_b.get('de_k_rel_offset_high', 1.2)
+    k_de_cxcy_abs_px = cfg_b.get('de_k_cxcy_abs_offset_px', 0.15 * max(img_width, img_height))
+    b_de_k_low = [max(10.,k_params_init_sensor_for_DE[0]*k_de_rel_low), max(10.,k_params_init_sensor_for_DE[1]*k_de_rel_low),
+                  max(0.,k_params_init_sensor_for_DE[2]-k_de_cxcy_abs_px), max(0.,k_params_init_sensor_for_DE[3]-k_de_cxcy_abs_px)]
+    b_de_k_high = [k_params_init_sensor_for_DE[0]*k_de_rel_high, k_params_init_sensor_for_DE[1]*k_de_rel_high,
+                   min(float(img_width-1),k_params_init_sensor_for_DE[2]+k_de_cxcy_abs_px), min(float(img_height-1),k_params_init_sensor_for_DE[3]+k_de_cxcy_abs_px)]
+    # D bounds for DE
+    b_de_d_low, b_de_d_high = [], []
+    if num_d_params > 0:
+        d_de_abs_offset_val = np.array(cfg_b.get('de_d_abs_offset', np.full(num_d_params, 0.15)))
+        if len(d_de_abs_offset_val) != num_d_params: d_de_abs_offset_val = np.resize(np.full(num_d_params,0.15), num_d_params)
+        b_de_d_low = list(flat_initial_D_sensor_cfg - d_de_abs_offset_val)
+        b_de_d_high = list(flat_initial_D_sensor_cfg + d_de_abs_offset_val)
+        for i_d_de in range(num_d_params):
+            if b_de_d_low[i_d_de] >= b_de_d_high[i_d_de]: (b_de_d_low[i_d_de], b_de_d_high[i_d_de]) = (b_de_d_high[i_d_de]-0.01, b_de_d_low[i_d_de]+0.01)
+
+    de_bounds = list(zip(np.concatenate((b_de_xi_low, b_de_k_low, b_de_d_low)),
+                         np.concatenate((b_de_xi_high, b_de_k_high, b_de_d_high))))
+
+    de_obj_data = {
+        "inlier_matches_map_undistorted_ideal": inlier_matches_map_SAMPLED,
+        "precalculated_target_distorted_points": precalculated_target_distorted_points_map_SAMPLED,
+        "query_indices_for_opt": query_indices_SAMPLED,
         "query_timestamps_rec_us": query_timestamps_rec_us,
         "ego_interpolator_us": functools.partial(get_pose_for_timestamp, timestamps_us=ego_timestamps_us, poses=ego_poses, tolerance_us=interpolation_tolerance_us),
-        "K_initial_ideal_for_undistorted_input": K_initial_ideal_for_undistorted_input,
-        "model_type": model_type,
-        "img_width": img_width,
-        "img_height": img_height,
+        "model_type": model_type, "img_width": img_width, "img_height": img_height,
         "dt_bounds_seconds_de_inner_opt": dt_bounds_seconds_de_inner_opt,
         "num_d_params": num_d_params,
-        # Add DE robust loss parameters
-        "de_robust_loss_type": de_robust_loss_type,
-        "de_robust_loss_scale": de_robust_loss_scale,
-        "de_popsize_factor_for_log": de_popsize_factor # For logging inside objective if needed
+        "de_robust_loss_type": de_robust_loss_type, "de_robust_loss_scale": de_robust_loss_scale,
+        "de_popsize_factor_for_log": de_popsize_factor
     }
-    
-    logging.info(f"Running Differential Evolution (PopFactor={de_popsize_factor}, MaxIter={de_maxiter}, Workers={de_workers})...")
-    logging.info(f"DE Objective using Robust Loss: Type='{de_robust_loss_type}', Scale={de_robust_loss_scale}")
-    de_start_time = time.time()
-    
-    de_result = differential_evolution(
-        de_objective_func_global,
-        bounds=de_bounds_list,
-        args=(de_objective_data_for_call,),
-        strategy='best1bin', maxiter=de_maxiter, popsize=de_popsize_factor,
-        tol=0.01, mutation=(0.5, 1), recombination=0.7, # Standard DE params
-        polish=False, disp=True, workers=de_workers, updating='deferred' # 'deferred' often better with workers
-    )
-    de_duration = time.time() - de_start_time
-    logging.info(f"Differential Evolution finished in {de_duration:.2f}s. Final avg robust cost: {de_result.fun:.6e}")
+    logging.info(f"Running DE (PopFactor={de_popsize_factor}, MaxIter={de_maxiter}, Workers={de_workers}) on {len(query_indices_SAMPLED)} images with SAMPLED points...")
+    de_start_t = time.time()
+    de_res = differential_evolution(de_objective_func_global, bounds=de_bounds, args=(de_obj_data,),
+                                  strategy='best1bin', maxiter=de_maxiter, popsize=de_popsize_factor,
+                                  tol=0.001, polish=False, disp=True, workers=de_workers, updating='deferred')
+    logging.info(f"DE finished in {time.time()-de_start_t:.2f}s. Final avg robust cost: {de_res.fun:.6e}")
 
-    # ... (Unpacking DE results, calculating optimal dt_i values based on DE's best, logging remains the same) ...
-    if not de_result.success:
-        logging.warning(f"Differential Evolution did not converge successfully: {de_result.message}")
-        # Decide if to proceed or use initial if DE failed badly. For now, proceed with DE's best.
-        logging.warning("Proceeding with DE's best found parameters for final LS, but results may be suboptimal.")
+    if not de_res.success and de_res.fun > 1e5: # High cost threshold indicates severe failure
+        logging.error(f"DE failed badly (cost: {de_res.fun:.2e}). Aborting hybrid refinement.")
+        dt_map_fallback = {idx: 0.0 for idx in query_indices_for_opt_ALL_PNP_SUCCESS}
+        return initial_T_ego_cam_from_config, K_initial_sensor_cfg, initial_D_sensor_coeffs_cfg, dt_map_fallback, de_res
 
-    X_de_best = de_result.x
+    X_de_best = de_res.x
     xi_ego_cam_best_de = X_de_best[:6]
     k_params_sensor_best_de = X_de_best[6:6+NUM_K_PARAMS]
-    d_params_sensor_best_de = X_de_best[6+NUM_K_PARAMS : 6+NUM_K_PARAMS+num_d_params]
-
+    d_params_sensor_best_de_flat = X_de_best[6+NUM_K_PARAMS : 6+NUM_K_PARAMS+num_d_params]
     T_ego_cam_best_de = se3_to_SE3(xi_ego_cam_best_de)
-    K_sensor_best_de = np.array([[k_params_sensor_best_de[0], 0, k_params_sensor_best_de[2]],
-                                 [0, k_params_sensor_best_de[1], k_params_sensor_best_de[3]],
-                                 [0, 0, 1]])
-
+    K_sensor_best_de = np.array([[k_params_sensor_best_de[0],0,k_params_sensor_best_de[2]],
+                                 [0,k_params_sensor_best_de[1],k_params_sensor_best_de[3]], [0,0,1]])
     logging.info(f"Best T_ego_cam from DE:\n{np.round(T_ego_cam_best_de,5)}")
     logging.info(f"Best K_sensor from DE:\n{np.round(K_sensor_best_de,4)}")
-    logging.info(f"Best D_sensor from DE: {np.round(d_params_sensor_best_de,6)}")
+    if d_params_sensor_best_de_flat.size > 0: logging.info(f"Best D_sensor from DE: {np.round(d_params_sensor_best_de_flat,6)}")
 
-    logging.info("Calculating optimal dt_i values based on DE's best global parameters for LS initialization...")
-    dt_best_de_map_seconds = {}
-    for img_idx in query_indices_for_opt: # Iterate over images considered for optimization
-        p2d_undist_ideal_kps_img, P3d_world_img = inlier_matches_map_undistorted_ideal[img_idx]
-        if p2d_undist_ideal_kps_img.shape[0] == 0: # Should not happen if query_indices_for_opt is pre-filtered
-            dt_best_de_map_seconds[img_idx] = 0.0; continue
-        
+    # Calculate dt_ls_init_map_seconds using SAMPLED data and DE's best params
+    dt_ls_init_map_seconds = {}
+    logging.info("Calculating dt values for LS initialization using DE results and SAMPLED points...")
+    for img_idx in query_indices_SAMPLED: # Iterate over indices that contributed to DE
+        P3d_world_sampled_img = inlier_matches_map_SAMPLED[img_idx][1]
+        target_dist_sampled_img = precalculated_target_distorted_points_map_SAMPLED[img_idx]
         t_rec_us_img = query_timestamps_rec_us[img_idx]
 
-        p2d_target_distorted_for_final_dt = generate_target_distorted_points(
-            p2d_undist_ideal_kps_img, K_sensor_best_de, d_params_sensor_best_de,
-            model_type, K_initial_ideal_for_undistorted_input, img_width, img_height
-        )
-        if p2d_target_distorted_for_final_dt.shape[0] == 0: # Should be handled by generate_target
-            dt_best_de_map_seconds[img_idx] = 0.0; continue
+        if P3d_world_sampled_img.shape[0] == 0 or target_dist_sampled_img.shape[0] == 0:
+            dt_ls_init_map_seconds[img_idx] = 0.0; continue
 
-        # This inner LS uses 'linear' loss as per refine_timestamp_only_revised_for_de default
         dt_opt_s, _, _, _, _ = refine_timestamp_only_revised_for_de(
-            T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, model_type,
-            img_width, img_height,
-            p2d_target_distorted_for_final_dt, P3d_world_img, t_rec_us_img,
-            de_objective_data_for_call["ego_interpolator_us"],
-            dt_bounds_seconds=dt_bounds_seconds_de_inner_opt, # Use inner opt bounds
-            loss_function='linear' # Explicitly linear for speed here
+            current_T_ego_cam=T_ego_cam_best_de, current_K_matrix_sensor=K_sensor_best_de,
+            current_D_coeffs_sensor=d_params_sensor_best_de_flat, current_model_type=model_type,
+            current_img_width=img_width, current_img_height=img_height,
+            p2d_target_distorted_pixels=target_dist_sampled_img, # Target from sampled data
+            P3d_world_points=P3d_world_sampled_img, # 3D from sampled data
+            t_rec_us=t_rec_us_img, ego_interpolator_us=de_obj_data["ego_interpolator_us"],
+            dt_bounds_seconds=dt_bounds_seconds_de_inner_opt, loss_function='linear'
         )
-        dt_best_de_map_seconds[img_idx] = dt_opt_s if dt_opt_s is not None else 0.0
+        dt_ls_init_map_seconds[img_idx] = dt_opt_s if dt_opt_s is not None else 0.0
 
-    # --- Final least_squares Fine-tuning ---
-    # The OptimizationData and compute_residuals for this final LS step are standard (non-robust cost internally).
-    # The `loss_function_final_ls` parameter to `least_squares` handles robustness here.
-    logging.info("--- Starting Final least_squares Fine-tuning ---")
-    logging.info(f"Final LS using Robust Loss: Type='{loss_function_final_ls}'")
+    # --- 5. Final Least Squares (OptData also uses SAMPLED data, but its targets are fixed original global targets) ---
+    logging.info("--- Starting Final least_squares Fine-tuning (on SAMPLED points) ---")
+    opt_data_ls_dbg_params = {} # Setup as before if debug needed for LS OptData
+    if debug_opt_data_vis_params:
+        ls_dbg_vis_dir = Path(debug_opt_data_vis_params.get('output_vis_dir_base', 'vis_debug')) / \
+                         debug_opt_data_vis_params.get('output_vis_dir_LS_targets_subdir', 'LS_OptData_debug_HybridSpatial')
+        opt_data_ls_dbg_params = {
+            'debug_image_idx_to_name_map': debug_opt_data_vis_params.get('image_idx_to_name_map'),
+            'debug_query_image_dir': debug_opt_data_vis_params.get('query_image_dir'),
+            'debug_output_vis_dir': ls_dbg_vis_dir,
+            'debug_vis_image_indices': debug_opt_data_vis_params.get('vis_image_indices_LS_targets', [])
+        }
+
     try:
+        # OptData's internal targets are based on K_initial_sensor_cfg and initial_D_sensor_coeffs_cfg.
+        # It receives the SAMPLED p2d_ideal points and their P3D points.
         opt_data_final_ls = OptimizationData(
-            inlier_matches_map_us=inlier_matches_map_undistorted_ideal, # Using all PnP-successful images
-            ego_interpolator_us=de_objective_data_for_call["ego_interpolator_us"],
-            K_initial_ideal=K_sensor_best_de,       # Start K from DE's best K_sensor
-            # K_initial_ideal=K_initial_ideal_for_undistorted_input,
-            D_initial_sensor=d_params_sensor_best_de, # Start D from DE's best D_sensor
-            # D_initial_sensor=initial_D_sensor_coeffs,
-            model_type=model_type,
-            img_width=img_width, img_height=img_height,
-            t_rec_map_us=query_timestamps_rec_us, # For all PnP-successful images
-            num_images_passed_to_constructor=len(query_indices_for_opt),
-            debug_image_idx_to_name_map=debug_opt_data_vis_params.get('image_idx_to_name_map') if debug_opt_data_vis_params else None,
-            debug_query_image_dir=debug_opt_data_vis_params.get('query_image_dir') if debug_opt_data_vis_params else None,
-            debug_output_vis_dir=debug_opt_data_vis_params.get('output_vis_dir') if debug_opt_data_vis_params else None,
-            debug_vis_image_indices=debug_opt_data_vis_params.get('vis_image_indices') if debug_opt_data_vis_params else []
+            inlier_matches_map_us=inlier_matches_map_SAMPLED, # SAMPLED p2d_ideal and P3D_world
+            ego_interpolator_us=de_obj_data["ego_interpolator_us"],
+            K_initial_ideal_for_opt_data_targets=K_initial_sensor_cfg, # Original config K for OptData's targets
+            D_initial_sensor_for_opt_data_targets=initial_D_sensor_coeffs_cfg, # Original config D
+            model_type=model_type, img_width=img_width, img_height=img_height,
+            t_rec_map_us=query_timestamps_rec_us,
+            num_images_passed_to_constructor=len(query_indices_SAMPLED),
+            K_GLOBAL_IDEAL_FOR_UNDIST_NORMALIZATION=K_ideal_plane_definition,
+            **opt_data_ls_dbg_params
         )
-    except Exception as e_optdata:
-        logging.error(f"Failed to create OptimizationData for final LS: {e_optdata}", exc_info=True)
-        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, dt_best_de_map_seconds, de_result
+    except Exception as e_optdata_ls:
+        logging.error(f"Failed to create OptData for final LS: {e_optdata_ls}", exc_info=True)
+        dt_map_fallback = {idx: dt_ls_init_map_seconds.get(idx, 0.0) for idx in query_indices_for_opt_ALL_PNP_SUCCESS}
+        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de_flat, dt_map_fallback, de_res
 
-    if opt_data_final_ls.num_opt_images == 0: # Check if opt_data itself filtered out all images
-        logging.error("OptData for final LS has zero images. Cannot run final LS. Returning DE results.")
-        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, dt_best_de_map_seconds, de_result
+    if opt_data_final_ls.num_opt_images == 0:
+        logging.error("OptData for final LS (HybridSpatial) has zero images. Returning DE results.")
+        dt_map_fallback = {idx: dt_ls_init_map_seconds.get(idx, 0.0) for idx in query_indices_for_opt_ALL_PNP_SUCCESS}
+        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de_flat, dt_map_fallback, de_res
 
-    xi_ego_cam_ls_init = xi_ego_cam_best_de
-    # k_params for LS init are from K_sensor_best_de
-    k_params_ls_init = np.array([K_sensor_best_de[0,0], K_sensor_best_de[1,1], K_sensor_best_de[0,2], K_sensor_best_de[1,2]])
-    d_params_ls_init = d_params_sensor_best_de # This is already flat
-    
-    # Initialize dt for LS from the dt_best_de_map_seconds, ordered by opt_data_final_ls.image_indices
-    dt_ls_init_seconds = np.zeros(opt_data_final_ls.num_opt_images)
-    for i, img_idx_in_opt_data in enumerate(opt_data_final_ls.image_indices):
-        dt_ls_init_seconds[i] = dt_best_de_map_seconds.get(img_idx_in_opt_data, 0.0)
+    xi_ls_init = xi_ego_cam_best_de
+    k_ls_init = k_params_sensor_best_de
+    d_ls_init = d_params_sensor_best_de_flat
+    dt_ls_init_vec = np.zeros(opt_data_final_ls.num_opt_images) # OptData determines actual num_dt_params
+    for i, img_idx_ls_optdata in enumerate(opt_data_final_ls.image_indices): # image_indices are from query_indices_SAMPLED
+        dt_ls_init_vec[i] = dt_ls_init_map_seconds.get(img_idx_ls_optdata, 0.0)
+    x0_ls = np.concatenate((xi_ls_init, k_ls_init, d_ls_init, dt_ls_init_vec))
 
-    x0_ls = np.concatenate((xi_ego_cam_ls_init, k_params_ls_init, d_params_ls_init, dt_ls_init_seconds))
-
-    # ... (Bounds for final LS: bounds_ls_low, bounds_ls_high, bounds_final_ls remains the same) ...
-    # Tighter bounds for LS, centered around DE's solution
-    bounds_ls_low = list(xi_ego_cam_ls_init - np.array([0.03, 0.03, 0.03, 0.08, 0.08, 0.08])) # Tighter than DE
-    bounds_ls_high = list(xi_ego_cam_ls_init + np.array([0.03, 0.03, 0.03, 0.08, 0.08, 0.08]))
-
-    # K bounds for LS, tighter around k_params_ls_init
-    k_ls_b_low = list(k_params_ls_init * 0.98) # e.g., +/- 2%
-    k_ls_b_high = list(k_params_ls_init * 1.02)
-    # Ensure cx, cy stay within image (can be relaxed if principal point can be outside)
-    k_ls_b_low[2] = max(0, k_params_ls_init[2] - 0.05 * img_width) 
-    k_ls_b_high[2] = min(img_width-1, k_params_ls_init[2] + 0.05 * img_width)
-    k_ls_b_low[3] = max(0, k_params_ls_init[3] - 0.05 * img_height)
-    k_ls_b_high[3] = min(img_height-1, k_params_ls_init[3] + 0.05 * img_height)
-    bounds_ls_low.extend(k_ls_b_low)
-    bounds_ls_high.extend(k_ls_b_high)
-
+    # LS Bounds (tighter, around DE solution, using intrinsic_bounds_config)
+    ls_xi_abs_off = np.array(cfg_b.get('ls_xi_abs_offset', [0.03,0.03,0.03,0.08,0.08,0.08]))
+    b_ls_xi_low = xi_ls_init - ls_xi_abs_off; b_ls_xi_high = xi_ls_init + ls_xi_abs_off
+    ls_k_rel_low = cfg_b.get('ls_k_rel_offset_low',0.98); ls_k_rel_high = cfg_b.get('ls_k_rel_offset_high',1.02)
+    ls_k_cxcy_abs_px = cfg_b.get('ls_k_cxcy_abs_offset_px',0.05*max(img_width,img_height))
+    b_ls_k_low = [max(10.,k_ls_init[0]*ls_k_rel_low), max(10.,k_ls_init[1]*ls_k_rel_low),
+                  max(0.,k_ls_init[2]-ls_k_cxcy_abs_px), max(0.,k_ls_init[3]-ls_k_cxcy_abs_px)]
+    b_ls_k_high = [k_ls_init[0]*ls_k_rel_high, k_ls_init[1]*ls_k_rel_high,
+                   min(float(img_width-1),k_ls_init[2]+ls_k_cxcy_abs_px), min(float(img_height-1),k_ls_init[3]+ls_k_cxcy_abs_px)]
+    b_ls_d_low, b_ls_d_high = [], []
     if num_d_params > 0:
-        # D bounds for LS, tighter around d_params_ls_init
-        d_abs = np.abs(d_params_ls_init)
-        d_ls_b_low = list(d_params_ls_init - 0.05 * d_abs - 0.008) # e.g. +/- 5% of value + small constant
-        d_ls_b_high = list(d_params_ls_init + 0.05 * d_abs + 0.008)
-        for i_d in range(len(d_ls_b_low)): # Ensure low < high
-            if d_ls_b_low[i_d] >= d_ls_b_high[i_d]:
-                d_mid = (d_ls_b_low[i_d] + d_ls_b_high[i_d])/2.0
-                d_ls_b_low[i_d] = d_mid - 1e-4; d_ls_b_high[i_d] = d_mid + 1e-4
-        bounds_ls_low.extend(d_ls_b_low)
-        bounds_ls_high.extend(d_ls_b_high)
+        ls_d_abs_s = cfg_b.get('ls_d_abs_offset_scale',0.05); ls_d_abs_c = cfg_b.get('ls_d_abs_offset_const',0.008)
+        d_abs_ls_init = np.abs(d_ls_init)
+        b_ls_d_low = list(d_ls_init - ls_d_abs_s*d_abs_ls_init - ls_d_abs_c)
+        b_ls_d_high = list(d_ls_init + ls_d_abs_s*d_abs_ls_init + ls_d_abs_c)
+        for i_d_ls in range(num_d_params):
+            if b_ls_d_low[i_d_ls] >= b_ls_d_high[i_d_ls]: (b_ls_d_low[i_d_ls], b_ls_d_high[i_d_ls]) = (b_ls_d_high[i_d_ls]-1e-4, b_ls_d_low[i_d_ls]+1e-4)
+    bounds_ls = (np.concatenate((b_ls_xi_low,b_ls_k_low,b_ls_d_low, [dt_bounds_seconds_final_ls[0]]*opt_data_final_ls.num_opt_images)),
+                 np.concatenate((b_ls_xi_high,b_ls_k_high,b_ls_d_high, [dt_bounds_seconds_final_ls[1]]*opt_data_final_ls.num_opt_images)))
 
-    bounds_ls_low.extend([dt_bounds_seconds_final_ls[0]] * opt_data_final_ls.num_opt_images)
-    bounds_ls_high.extend([dt_bounds_seconds_final_ls[1]] * opt_data_final_ls.num_opt_images)
-    bounds_final_ls = (bounds_ls_low, bounds_ls_high)
-
-    # For `least_squares`, `f_scale` is used with robust loss functions.
-    # A common choice for f_scale is related to the expected stddev of inlier residuals (in pixels).
-    # If `de_robust_loss_scale` was a pixel error (e.g. 5.0 pixels), it can be used here.
-    f_scale_for_ls = de_robust_loss_scale # Use the same scale as DE for consistency if applicable
-                                        # or make it a new parameter `final_ls_f_scale`.
-
+    f_scale_ls = de_robust_loss_scale # Can be tuned separately
     try:
-        initial_ls_residuals = compute_residuals(x0_ls, opt_data_final_ls)
-        # Cost for 'linear' loss. If final_ls is robust, this is just for reference.
-        initial_ls_cost_linear = 0.5 * np.sum(initial_ls_residuals**2)
-        # Calculate initial cost with the *actual* robust loss chosen for final_ls
-        initial_ls_cost_robust = calculate_robust_cost_for_de(initial_ls_residuals, loss_function_final_ls, f_scale_for_ls)
-        logging.info(f"Final LS: Initial cost (from DE best, linear eval): {initial_ls_cost_linear:.4e}")
-        logging.info(f"Final LS: Initial cost (from DE best, robust '{loss_function_final_ls}' eval, scale={f_scale_for_ls}): {initial_ls_cost_robust:.4e}")
+        initial_ls_res = compute_residuals(x0_ls, opt_data_final_ls)
+        initial_ls_cost_rob = calculate_robust_cost_for_de(initial_ls_res, loss_function_final_ls, f_scale_ls)
+        logging.info(f"Final LS: Initial cost (from DE best, robust '{loss_function_final_ls}', scale={f_scale_ls}): {initial_ls_cost_rob:.4e}")
+    except Exception as e_ls_icost:
+        logging.error(f"Failed to compute initial cost for final LS: {e_ls_icost}. Returning DE results.", exc_info=True)
+        dt_map_fallback = {idx: dt_ls_init_map_seconds.get(idx, 0.0) for idx in query_indices_for_opt_ALL_PNP_SUCCESS}
+        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de_flat, dt_map_fallback, de_res
 
-    except Exception as e_ls_init_cost:
-        logging.error(f"Failed to compute initial cost for final LS: {e_ls_init_cost}. Returning DE results.", exc_info=True)
-        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, dt_best_de_map_seconds, de_result
-        
-    final_ls_result_obj = None
+    final_ls_res_obj = None
     try:
-        # The `loss` parameter in `least_squares` handles the robust cost function application.
-        # `f_scale` is crucial for 'huber', 'cauchy', 'arctan', 'soft_l1'.
-        final_ls_result_obj = least_squares(
-            compute_residuals, x0_ls, jac='2-point', bounds=bounds_final_ls, method='trf',
-            ftol=1e-9, xtol=1e-9, gtol=1e-9,
-            loss=loss_function_final_ls, # This enables robust loss
-            f_scale=f_scale_for_ls,     # Scale for the robust loss function
-            verbose=final_ls_verbose,
-            max_nfev=2000 * len(x0_ls), 
-            args=(opt_data_final_ls,)
+        final_ls_res_obj = least_squares(
+            compute_residuals, x0_ls, jac='2-point', bounds=bounds_ls, method='trf',
+            ftol=1e-9, xtol=1e-9, gtol=1e-9, loss=loss_function_final_ls, f_scale=f_scale_ls,
+            verbose=final_ls_verbose, max_nfev=2500 * len(x0_ls), args=(opt_data_final_ls,)
         )
-        logging.info(f"Final LS optimization finished. Status: {final_ls_result_obj.status} ({final_ls_result_obj.message})")
-        logging.info(f"Final LS cost (using '{loss_function_final_ls}' with f_scale={f_scale_for_ls}): {final_ls_result_obj.cost:.4e}. Optimality: {final_ls_result_obj.optimality:.4e}")
-    except Exception as e_ls_final:
-        logging.error(f"Final LS optimization crashed: {e_ls_final}. Returning DE results.", exc_info=True)
-        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, dt_best_de_map_seconds, de_result
+        logging.info(f"Final LS opt finished. Status: {final_ls_res_obj.status} ({final_ls_res_obj.message})")
+        logging.info(f"Final LS cost (robust '{loss_function_final_ls}', scale={f_scale_ls}): {final_ls_res_obj.cost:.4e}. Opt: {final_ls_res_obj.optimality:.4e}")
+    except Exception as e_ls_final_run:
+        logging.error(f"Final LS optimization crashed: {e_ls_final_run}. Returning DE results.", exc_info=True)
+        dt_map_fallback = {idx: dt_ls_init_map_seconds.get(idx, 0.0) for idx in query_indices_for_opt_ALL_PNP_SUCCESS}
+        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de_flat, dt_map_fallback, de_res
 
-    # Compare final LS cost with the initial cost *evaluated using the same robust loss and scale*
-    if final_ls_result_obj.success or final_ls_result_obj.cost < initial_ls_cost_robust:
-        X_ls_final = final_ls_result_obj.x
+    # Unpack final results, defaulting to DE if LS fails or doesn't improve
+    T_ego_cam_final = T_ego_cam_best_de
+    K_sensor_final = K_sensor_best_de
+    D_sensor_final_flat = d_params_sensor_best_de_flat
+    # Initialize final_dt_map for ALL original PnP successful images
+    final_refined_delta_t_map_seconds = {idx: 0.0 for idx in query_indices_for_opt_ALL_PNP_SUCCESS}
+    # Populate with dt values from DE-based initialization (for those in SAMPLED set)
+    for idx_sampled_dt, dt_val_sampled in dt_ls_init_map_seconds.items():
+        if idx_sampled_dt in final_refined_delta_t_map_seconds:
+            final_refined_delta_t_map_seconds[idx_sampled_dt] = dt_val_sampled
+
+    improvement_thresh_factor = 0.999 # Allow slight cost increase if success flag is True
+    if final_ls_res_obj and (final_ls_res_obj.success or final_ls_res_obj.cost < initial_ls_cost_rob * improvement_thresh_factor):
+        X_ls_final = final_ls_res_obj.x
         T_ego_cam_final = se3_to_SE3(X_ls_final[:6])
-        k_final = X_ls_final[6:6+NUM_K_PARAMS]
-        K_sensor_final = np.array([[k_final[0], 0, k_final[2]], [0, k_final[1], k_final[3]], [0,0,1]])
-        D_sensor_final = X_ls_final[6+NUM_K_PARAMS : 6+NUM_K_PARAMS+num_d_params]
-        
-        dt_final_seconds_flat = X_ls_final[6+NUM_K_PARAMS+num_d_params:]
-        final_refined_delta_t_map_seconds = {idx: 0.0 for idx in query_indices_for_opt} # Initialize for all
-        # Populate using opt_data_final_ls.image_indices which are the ones optimized in LS
-        for i, img_idx_in_opt_data in enumerate(opt_data_final_ls.image_indices):
-            if img_idx_in_opt_data in final_refined_delta_t_map_seconds: # Should always be true
-                 final_refined_delta_t_map_seconds[img_idx_in_opt_data] = dt_final_seconds_flat[i]
-        
-        logging.info("Successfully refined all parameters using DE + LS.")
-        return T_ego_cam_final, K_sensor_final, D_sensor_final, final_refined_delta_t_map_seconds, final_ls_result_obj
+        k_final_ls = X_ls_final[6:6+NUM_K_PARAMS]
+        K_sensor_final = np.array([[k_final_ls[0],0,k_final_ls[2]], [0,k_final_ls[1],k_final_ls[3]], [0,0,1]])
+        D_sensor_final_flat = X_ls_final[6+NUM_K_PARAMS : 6+NUM_K_PARAMS+num_d_params]
+        dt_final_flat_ls = X_ls_final[6+NUM_K_PARAMS+num_d_params:]
+        # Update dt map with LS results for images processed by LS's OptData
+        for i, img_idx_ls_optdata_final in enumerate(opt_data_final_ls.image_indices):
+            if img_idx_ls_optdata_final in final_refined_delta_t_map_seconds:
+                 final_refined_delta_t_map_seconds[img_idx_ls_optdata_final] = dt_final_flat_ls[i]
+        logging.info("Successfully refined all parameters using DE (spatially sampled) + LS (spatially sampled).")
     else:
-        logging.warning(f"Final LS did not improve upon DE result (Robust Cost DE: {initial_ls_cost_robust:.4e} vs LS: {final_ls_result_obj.cost:.4e}) or failed. Returning DE best parameters.")
-        return T_ego_cam_best_de, K_sensor_best_de, d_params_sensor_best_de, dt_best_de_map_seconds, de_result
+        logging.warning(f"Final LS did not improve significantly or failed. Returning DE best parameters with DE-initialized dt map.")
+
+    logging.info(f"Final Refined T_ego_cam (HybridSpatial):\n{np.round(T_ego_cam_final, 6)}")
+    logging.info(f"Final Refined K_sensor (HybridSpatial):\n{np.round(K_sensor_final, 4)}")
+    if D_sensor_final_flat.size > 0: logging.info(f"Final Refined D_sensor (HybridSpatial):\n{np.round(D_sensor_final_flat, 7)}")
+
+    return T_ego_cam_final, K_sensor_final, D_sensor_final_flat, final_refined_delta_t_map_seconds, final_ls_res_obj
 
 def refine_all_parameters(
     initial_T_ego_cam: np.ndarray,
@@ -4893,7 +4950,10 @@ def run_pipeline(
     num_distortpoints_debug_images: int = 1,
     de_popsize_factor: int = 15, # DE param
     de_maxiter: int = 150,       # DE param
-    de_workers: int = -1         # DE param
+    de_workers: int = -1,         # DE param
+    spatial_grid_size_hybrid: int = 25,
+    max_pts_per_cell_hybrid: int = 1,
+    min_total_pts_hybrid: int = 100 # Reduced min threshold for testing
 ):
     # ... (Setup output_dir, hloc_out_dir etc. - REMAINS THE SAME) ...
     output_dir = Path(output_dir)
@@ -5173,6 +5233,9 @@ def run_pipeline(
                 vis_count +=1
             logging.info(f"Finished generating {vis_count} initial map projection visualizations.")
 
+        # Determine num_d_params based on the initial D_sensor from config
+        flat_initial_D_sensor_coeffs_cfg = pipeline_D_sensor.flatten() if pipeline_D_sensor is not None else np.array([])
+        num_d_params_cfg = len(flat_initial_D_sensor_coeffs_cfg)
 
         # --- 3.5 PnP Loop (Requires successful matching and depth linking) ---
         all_pnp_results: list[PnPResult] = []
@@ -5286,54 +5349,133 @@ def run_pipeline(
             if refinement_query_indices:
                 logging.info(f"--- Running Hybrid Refinement on {len(refinement_query_indices)} PnP-successful Images ---")
                 
-                # Define wider xi_offset for Stage 1 DE if desired, or use a new CLI arg
-                stage1_xi_offset_for_de = np.array([0.2, 0.2, 0.2, 0.4, 0.4, 0.4]) # Example wider for DE
+                # Prepare debug viz params for OptData creation within hybrid refinement's LS stage
+                # AND for DE target pre-calculation step
+                debug_params_for_hybrid_refinement = {}
+                if visualize_distortpoints_debug and query_idx_to_name and successful_pnp_results:
+                    # General params
+                    debug_params_for_hybrid_refinement['image_idx_to_name_map'] = query_idx_to_name
+                    debug_params_for_hybrid_refinement['query_image_dir'] = query_image_dir
 
-                opt_T_ego_cam, opt_K_sensor, opt_D_sensor, opt_delta_t_map_s, _ = refine_parameters_de_extr_then_ls_joint(
-                    initial_T_ego_cam_from_config=initial_T_ego_cam_guess,
+                    # For DE pre-calculated target visualization
+                    de_targets_vis_dir_name = 'DE_precalculated_targets_debug'
+                    de_targets_vis_dir_path = vis_base_output_dir / de_targets_vis_dir_name
+                    de_targets_vis_indices = [res.query_idx for res in successful_pnp_results[:num_distortpoints_debug_images]]
+                    debug_params_for_hybrid_refinement['output_vis_dir_DE_targets'] = de_targets_vis_dir_path
+                    debug_params_for_hybrid_refinement['vis_image_indices_DE_targets'] = de_targets_vis_indices
+                    
+                    # For LS OptData internal target visualization
+                    ls_targets_vis_dir_name = 'LS_OptData_targets_debug'
+                    ls_targets_vis_dir_path = vis_base_output_dir / ls_targets_vis_dir_name
+                    ls_targets_vis_indices = [res.query_idx for res in successful_pnp_results[:num_distortpoints_debug_images]] # Can be same or different
+                    debug_params_for_hybrid_refinement['output_vis_dir_LS_targets_subdir'] = ls_targets_vis_dir_name # Subdir name for OptData
+                    debug_params_for_hybrid_refinement['output_vis_dir_base'] = vis_base_output_dir # Base for OptData path construction
+                    debug_params_for_hybrid_refinement['vis_image_indices_LS_targets'] = ls_targets_vis_indices
+
+
+                opt_T_ego_cam, opt_K_sensor, opt_D_sensor, opt_delta_t_map_s, _ = refine_all_parameters_hybrid(
+                    initial_T_ego_cam_from_config=pipeline_initial_T_ego_cam,
                     pnp_derived_T_ego_cam_guess=pnp_derived_T_ego_cam,
-                    inlier_matches_map_undistorted_ideal=refinement_inlier_matches,
-                    ego_timestamps_us=ego_timestamps_us,
-                    ego_poses=ego_poses_list,
-                    query_indices_for_opt=refinement_query_indices,
-                    query_timestamps_rec_us=refinement_query_timestamps_rec_us,
-                    K_initial_sensor=camera_intrinsics_matrix_ideal, # Initial K_sensor for LS stage
-                    initial_D_sensor_coeffs=camera_distortion_array_sensor, # Initial D_sensor for LS stage
-                    model_type=camera_model_type,
-                    img_width=image_width, img_height=image_height,
-                    K_ideal_for_undistorted_input_normalization=camera_intrinsics_matrix_ideal,
-                    
-                    stage1_de_xi_bounds_abs_offset=stage1_xi_offset_for_de, # Wider bounds for Stage 1 DE
-                    stage1_de_popsize_factor=de_popsize_factor,
-                    stage1_de_maxiter=de_maxiter,
-                    
-                    de_robust_loss_type=de_robust_loss_type,
-                    de_robust_loss_scale=de_robust_loss_scale,
-                    de_workers=de_workers,
-
-                    final_ls_dt_bounds_seconds=dt_bounds_final_ls,
-                    final_ls_loss_function=loss_function_final_ls,
+                    inlier_matches_map_undistorted_ideal_ALL_PNP_SUCCESS=refinement_inlier_matches, # Pass PnP success here
+                    ego_timestamps_us=ego_timestamps_us, ego_poses=ego_poses_list,
+                    query_indices_for_opt_ALL_PNP_SUCCESS=refinement_query_indices, # Use PnP success indices
+                    query_timestamps_rec_us=refinement_query_timestamps_rec_us, # Pass indexed map
+                    K_ideal_plane_definition=pipeline_K_ideal,
+                    K_initial_sensor_cfg=pipeline_K_ideal, # Initial K_sensor is K_ideal from config
+                    initial_D_sensor_coeffs_cfg=pipeline_D_sensor,
+                    model_type=camera_model_type, img_width=image_width, img_height=image_height,
+                    dt_bounds_seconds_de_inner_opt=dt_bounds_de_inner_opt,
+                    de_robust_loss_type=de_robust_loss_type, de_robust_loss_scale=de_robust_loss_scale,
+                    de_popsize_factor=de_popsize_factor, de_maxiter=de_maxiter, de_workers=de_workers,
+                    dt_bounds_seconds_final_ls=dt_bounds_final_ls, loss_function_final_ls=loss_function_final_ls,
                     final_ls_verbose=final_ls_opt_verbose,
-                    # Pass the cfg_intrinsic_bounds from main to constrain LS intrinsics
-                    final_ls_intrinsic_bounds_from_config=intrinsic_bounds_config, # This is `cfg_intrinsic_bounds` from main
-
-                    interpolation_tolerance_us=1,
-                    debug_opt_data_vis_params=opt_data_debug_params_for_ls
+                    interpolation_tolerance_us=1, intrinsic_bounds_config=intrinsic_bounds_config,
+                    spatial_distribution_grid_size=spatial_grid_size_hybrid,
+                    max_points_per_grid_cell=max_pts_per_cell_hybrid,
+                    min_total_distributed_points=min_total_pts_hybrid,
+                    debug_opt_data_vis_params=debug_params_for_hybrid_refinement
                 )
 
+                # debug_params_for_staged_refinement = {}
+                # if visualize_distortpoints_debug and query_idx_to_name and successful_pnp_results:
+                #     # ... (setup debug_params_for_staged_refinement as before) ...
+                #     debug_params_for_staged_refinement['image_idx_to_name_map'] = query_idx_to_name
+                #     debug_params_for_staged_refinement['query_image_dir'] = query_image_dir
+                #     base_vis_dir_for_staged = vis_base_output_dir / "staged_refinement_debug"
+                #     debug_params_for_staged_refinement['output_vis_dir_base'] = base_vis_dir_for_staged
+                #     global_targets_vis_indices = [res.query_idx for res in successful_pnp_results[:num_distortpoints_debug_images]]
+                #     debug_params_for_staged_refinement['vis_image_indices_global_targets'] = global_targets_vis_indices
+                #     final_ls_optdata_vis_indices = [res.query_idx for res in successful_pnp_results[:num_distortpoints_debug_images]]
+                #     debug_params_for_staged_refinement['vis_image_indices_final_ls_optdata'] = final_ls_optdata_vis_indices
+
+
+                # # Corrected call to refine_all_parameters_staged
+                # opt_T_ego_cam, opt_K_sensor, opt_D_sensor, opt_delta_t_map_s, _ = refine_all_parameters_staged(
+                #     initial_T_ego_cam_from_config=pipeline_initial_T_ego_cam, 
+                #     pnp_derived_T_ego_cam_guess=pnp_derived_T_ego_cam, 
+                #     inlier_matches_map_undistorted_ideal=refinement_inlier_matches,
+                #     ego_timestamps_us=ego_timestamps_us,
+                #     ego_poses=ego_poses_list,
+                #     query_indices_for_opt=refinement_query_indices,
+                #     query_timestamps_rec_us=refinement_query_timestamps_rec_us,
+                    
+                #     # Parameters defining the input data and initial sensor config:
+                #     K_ideal_plane_definition=pipeline_K_ideal,        # K of the undistorted plane (where PnP points live)
+                #     K_initial_sensor_cfg=pipeline_K_ideal,            # Initial K of the physical sensor (from cameras.cfg, often same as K_ideal if D is for it)
+                #     initial_D_sensor_coeffs_cfg=pipeline_D_sensor,    # Initial D of the physical sensor (from cameras.cfg)
+                    
+                #     model_type=pipeline_model_type,
+                #     img_width=pipeline_img_w, img_height=pipeline_img_h,
+                    
+                #     # Stage 1 DE Extrinsics Params
+                #     stage1_de_xi_bounds_abs_offset=np.array(cfg_intrinsic_bounds.get('de_xi_abs_offset_stage1', [0.3, 0.3, 0.3, 0.5, 0.5, 0.5])),
+                #     stage1_de_popsize_factor=de_popsize_factor, # from args
+                #     stage1_de_maxiter=de_maxiter,               # from args
+                    
+                #     # Stage 2 DE Intrinsics Params
+                #     stage2_de_k_bounds_rel_offset=tuple(cfg_intrinsic_bounds.get('de_k_rel_offset_stage2', (0.99, 1.01))),
+                #     stage2_de_cxcy_bounds_abs_offset_px=float(cfg_intrinsic_bounds.get('de_k_cxcy_abs_offset_px_stage2', 5.0)),
+                #     # Ensure stage2_de_d_bounds_abs_offset is sized correctly using num_d_params_cfg
+                #     stage2_de_d_bounds_abs_offset=np.array(cfg_intrinsic_bounds.get('de_d_abs_offset_stage2', [0.05, 0.03, 0.001, 0.001, 0.01])[:num_d_params_cfg] if num_d_params_cfg > 0 else []),
+                #     stage2_de_popsize_factor=de_popsize_factor, # from args
+                #     stage2_de_maxiter=de_maxiter,               # from args
+
+                #     # Shared DE params
+                #     de_robust_loss_type=de_robust_loss_type,
+                #     de_robust_loss_scale=de_robust_loss_scale,
+                #     de_workers=de_workers,                      # from args
+
+                #     # Stage 3 (Final LS) params
+                #     dt_bounds_seconds_final_ls=dt_bounds_final_ls,
+                #     loss_function_final_ls=loss_function_final_ls,
+                #     final_ls_verbose=final_ls_opt_verbose,
+                #     final_ls_xi_bounds_abs_offset=np.array(cfg_intrinsic_bounds.get('ls_xi_abs_offset', [0.3, 0.3, 0.3, 0.5, 0.5, 0.5])),
+                #     final_ls_k_bounds_rel_offset=tuple(cfg_intrinsic_bounds.get('ls_k_rel_offset', (0.9, 1.1))),
+                #     final_ls_cxcy_bounds_abs_offset_px=float(cfg_intrinsic_bounds.get('ls_k_cxcy_abs_offset_px', 30.0)),
+                #     final_ls_d_bounds_abs_offset_scale=float(cfg_intrinsic_bounds.get('ls_d_abs_offset_scale', 0.05)),
+                #     final_ls_d_bounds_abs_offset_const=float(cfg_intrinsic_bounds.get('ls_d_abs_offset_const', 0.01)),
+                    
+                #     interpolation_tolerance_us=1, 
+                #     intrinsic_bounds_config=intrinsic_bounds_config, 
+                #     debug_opt_data_vis_params=debug_params_for_staged_refinement
+                # )
+                
                 if opt_T_ego_cam is not None:
                     final_refined_T_ego_cam = opt_T_ego_cam
                     final_refined_K_sensor = opt_K_sensor
-                    final_refined_D_sensor = opt_D_sensor
-                    # opt_delta_t_map_s is for images in refinement_query_indices
+                    final_refined_D_sensor = opt_D_sensor 
                     for q_idx, dt_val in opt_delta_t_map_s.items():
-                        final_delta_t_map_seconds[q_idx] = dt_val # Update main map
+                        final_delta_t_map_seconds[q_idx] = dt_val 
                 else:
                     logging.error("Hybrid refinement FAILED. Using initial guesses for final T_ego_cam, K_sensor, D_sensor.")
-                    # final_refined_T_ego_cam, K_sensor, D_sensor remain initial.
-                    # dt for PnP-successful images will be 0.0 (set in next block).
+                    # K_sensor and D_sensor remain pipeline_K_ideal, pipeline_D_sensor
+                    for q_idx_fail in refinement_query_indices:
+                        final_delta_t_map_seconds[q_idx_fail] = 0.0 # No dt refinement
             else: # No images for refinement (e.g. all PnP failed)
                  logging.warning("No images available for hybrid refinement after PnP. Using initial guesses.")
+                 # K_sensor and D_sensor remain pipeline_K_ideal, pipeline_D_sensor
+                 for q_idx_fail_all in query_idx_to_name.keys(): # Set dt=0 for all if no PnP success at all for refinement
+                    final_delta_t_map_seconds[q_idx_fail_all] = 0.0
         
         # --- 3.7 Post-Refinement: Set dt=0 for PnP-failed images, Calculate Final Poses ---
         for pnp_res in all_pnp_results: # Iterate all PnP attempts
@@ -5441,7 +5583,7 @@ if __name__ == "__main__":
     parser.add_argument('-c', '--camera_name', type=str, default=None, required=True, help='Camera name to be processed (must match a name in cameras.cfg).')
     # DE specific parameters
     parser.add_argument('--de_popsize_factor', type=int, default=15, help='Differential Evolution popsize factor (popsize = factor * num_params).')
-    parser.add_argument('--de_maxiter', type=int, default=150, help='Differential Evolution maximum iterations.')
+    parser.add_argument('--de_maxiter', type=int, default=300, help='Differential Evolution maximum iterations.')
     parser.add_argument('--de_workers', type=int, default=-1, help='Differential Evolution workers (-1 for all cores).')
     # Add other general args if needed (e.g., paths, already handled by fixed vars below)
     args = parser.parse_args()
@@ -5515,42 +5657,33 @@ if __name__ == "__main__":
 
     # --- Define Intrinsic Bounds Configuration (example) ---
     # This should be adapted based on expected model_type and D_sensor length
-    cfg_intrinsic_bounds = None
+    cfg_intrinsic_bounds = {}
+    cfg_intrinsic_bounds['de_xi_abs_offset'] = [0.785, 0.785, 0.785, 0.8, 0.8, 0.8]
+    cfg_intrinsic_bounds['de_k_rel_offset_low'] = 0.9
+    cfg_intrinsic_bounds['de_k_rel_offset_high'] = 1.1
+    cfg_intrinsic_bounds['de_k_cxcy_abs_offset_px'] = 0.1 * max(pipeline_img_w, pipeline_img_h)
+    default_d_offset_val = 0.15 # Default offset if model specific not found
     d_initial_flat_sensor = pipeline_D_sensor.flatten() if pipeline_D_sensor is not None else np.array([])
-    num_d_params_sensor = len(d_initial_flat_sensor)
+    num_d_params = len(d_initial_flat_sensor)
+    d_offset_de_specific = { # num_d_params as part of key
+        f"KANNALA_BRANDT_{4}": np.array([0.001, 0.001, 0.001, 0.001]),
+        f"PINHOLE_{4}": np.array([0.25, 0.15, 0.008, 0.008]), 
+        f"PINHOLE_{5}": np.array([0.25, 0.15, 0.008, 0.008, 0.15]) 
+    }.get(f"{pipeline_model_type}_{num_d_params}", np.full(num_d_params, default_d_offset_val))
+    cfg_intrinsic_bounds['de_d_abs_offset'] = d_offset_de_specific
 
-    # Example bounds (these are used by both DE and final LS, DE might need wider ones)
-    # The refine_all_parameters_hybrid function has its own logic for DE bounds based on these
-    # and for LS bounds.
-    if pipeline_model_type == "KANNALA_BRANDT" and num_d_params_sensor >= 4:
-        cfg_intrinsic_bounds = {
-            'k_low': [ pipeline_K_ideal[0,0]*0.85, pipeline_K_ideal[1,1]*0.85, pipeline_K_ideal[0,2]-0.12*pipeline_img_w, pipeline_K_ideal[1,2]-0.12*pipeline_img_h ],
-            'k_high': [ pipeline_K_ideal[0,0]*1.15, pipeline_K_ideal[1,1]*1.15, pipeline_K_ideal[0,2]+0.12*pipeline_img_w, pipeline_K_ideal[1,2]+0.12*pipeline_img_h ],
-            'd_low': list(d_initial_flat_sensor[:4] - np.array([0.08, 0.04, 0.015, 0.015])),
-            'd_high': list(d_initial_flat_sensor[:4] + np.array([0.08, 0.04, 0.015, 0.015]))
-        }
-    elif pipeline_model_type == "PINHOLE": # Example for Pinhole k1,k2,p1,p2
-        if num_d_params_sensor >= 4: # Adjust if optimizing more/less Pinhole D params
-            cfg_intrinsic_bounds = {
-                'k_low': [ pipeline_K_ideal[0,0]*0.85, pipeline_K_ideal[1,1]*0.85, pipeline_K_ideal[0,2]-0.12*pipeline_img_w, pipeline_K_ideal[1,2]-0.12*pipeline_img_h ],
-                'k_high': [ pipeline_K_ideal[0,0]*1.15, pipeline_K_ideal[1,1]*1.15, pipeline_K_ideal[0,2]+0.12*pipeline_img_w, pipeline_K_ideal[1,2]+0.12*pipeline_img_h ],
-                'd_low': list(d_initial_flat_sensor[:4] - np.array([0.15, 0.08, 0.003, 0.003])), # k1,k2,p1,p2
-                'd_high': list(d_initial_flat_sensor[:4] + np.array([0.15, 0.08, 0.003, 0.003]))
-            }
-        # Add more elif for other D param counts for Pinhole if needed
-
-    if cfg_intrinsic_bounds: # Ensure d_low < d_high for safety
-        for i in range(len(cfg_intrinsic_bounds['d_low'])):
-            if cfg_intrinsic_bounds['d_low'][i] >= cfg_intrinsic_bounds['d_high'][i]:
-                mid_d = (cfg_intrinsic_bounds['d_low'][i] + cfg_intrinsic_bounds['d_high'][i]) / 2.0
-                cfg_intrinsic_bounds['d_low'][i] = mid_d - 0.001
-                cfg_intrinsic_bounds['d_high'][i] = mid_d + 0.001
+    cfg_intrinsic_bounds['ls_xi_abs_offset'] = cfg_intrinsic_bounds['de_xi_abs_offset']
+    cfg_intrinsic_bounds['ls_k_rel_offset_low'] = 0.9
+    cfg_intrinsic_bounds['ls_k_rel_offset_high'] = 1.1
+    cfg_intrinsic_bounds['ls_k_cxcy_abs_offset_px'] = 0.1 * max(pipeline_img_w, pipeline_img_h)
+    cfg_intrinsic_bounds['ls_d_abs_offset_scale'] = 0.01
+    cfg_intrinsic_bounds['ls_d_abs_offset_const'] = 0.001
     
     # Dynamic point sizes and thresholds based on image resolution (example)
     reso_ratio = float(pipeline_img_w) / 1920.0 # Assuming 1920px width is baseline
     dynamic_render_point_size = max(1.0, 4.0 * reso_ratio)
-    dynamic_dist_thresh_px = max(5.0, 30.0 * reso_ratio)
-    dynamic_pnp_reproj_err = max(2.0, 6.0 * reso_ratio)
+    dynamic_dist_thresh_px = max(5.0, 60.0 * reso_ratio)
+    dynamic_pnp_reproj_err = max(2.0, 2.0 * reso_ratio)
     dynamic_vis_map_pt_size = max(1.0, 1.0 * reso_ratio)
 
 
@@ -5579,7 +5712,7 @@ if __name__ == "__main__":
         dt_bounds_final_ls=(-0.06, 0.06),     # For final LS dt opt
         final_ls_opt_verbose=1, # Verbosity for final LS
         de_robust_loss_type='cauchy', # Or 'huber', 'linear'
-        de_robust_loss_scale=dynamic_pnp_reproj_err, # Example: use PnP reproj error as scale (adjust as needed)
+        de_robust_loss_scale=(0.5*dynamic_pnp_reproj_err), # Example: use PnP reproj error as scale (adjust as needed)
         loss_function_final_ls='cauchy',
         visualize_steps=True, num_images_to_visualize=(len(initial_render_poses_map_cam) if initial_render_poses_map_cam else 1),
         visualize_map_point_size=dynamic_vis_map_pt_size,
@@ -5588,6 +5721,9 @@ if __name__ == "__main__":
         num_distortpoints_debug_images=2,
         de_popsize_factor=args.de_popsize_factor, # From argparse
         de_maxiter=args.de_maxiter,             # From argparse
-        de_workers=args.de_workers              # From argparse
+        de_workers=args.de_workers,             # From argparse
+        spatial_grid_size_hybrid=30,
+        max_pts_per_cell_hybrid=1,
+        min_total_pts_hybrid=50
     )
 
