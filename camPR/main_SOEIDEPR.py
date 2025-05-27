@@ -4066,14 +4066,14 @@ def refine_all_parameters_hybrid(
         num_d_params = len(flat_initial_D_sensor_cfg)
 
     T_ego_cam_for_de_center = initial_T_ego_cam_from_config
-    if pnp_derived_T_ego_cam_guess is not None:
-        try:
-            if np.isclose(np.linalg.det(pnp_derived_T_ego_cam_guess[:3,:3]), 1.0) and \
-               np.all(np.isfinite(pnp_derived_T_ego_cam_guess)):
-                T_ego_cam_for_de_center = pnp_derived_T_ego_cam_guess
-                logging.info("Using PnP-derived T_ego_cam as center for DE search.")
-        except Exception as e_pnp_val:
-            logging.warning(f"Error validating PnP T_ego_cam guess ({e_pnp_val}), using config T_ego_cam for DE center.")
+    # if pnp_derived_T_ego_cam_guess is not None:
+    #     try:
+    #         if np.isclose(np.linalg.det(pnp_derived_T_ego_cam_guess[:3,:3]), 1.0) and \
+    #            np.all(np.isfinite(pnp_derived_T_ego_cam_guess)):
+    #             T_ego_cam_for_de_center = pnp_derived_T_ego_cam_guess
+    #             logging.info("Using PnP-derived T_ego_cam as center for DE search.")
+    #     except Exception as e_pnp_val:
+    #         logging.warning(f"Error validating PnP T_ego_cam guess ({e_pnp_val}), using config T_ego_cam for DE center.")
 
     try:
         xi_ego_cam_de_initial_center = SE3_to_se3(T_ego_cam_for_de_center)
@@ -5601,8 +5601,8 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--steps', nargs='*', type=int, default=None, help='List of steps to run (e.g., 1 2 3)')
     parser.add_argument('-c', '--camera_name', type=str, default=None, required=True, help='Camera name to be processed (must match a name in cameras.cfg).')
     # DE specific parameters
-    parser.add_argument('--de_popsize_factor', type=int, default=15, help='Differential Evolution popsize factor (popsize = factor * num_params).')
-    parser.add_argument('--de_maxiter', type=int, default=300, help='Differential Evolution maximum iterations.')
+    parser.add_argument('--de_popsize_factor', type=int, default=20, help='Differential Evolution popsize factor (popsize = factor * num_params).')
+    parser.add_argument('--de_maxiter', type=int, default=500, help='Differential Evolution maximum iterations.')
     parser.add_argument('--de_workers', type=int, default=-1, help='Differential Evolution workers (-1 for all cores).')
     # Add other general args if needed (e.g., paths, already handled by fixed vars below)
     args = parser.parse_args()
@@ -5613,7 +5613,7 @@ if __name__ == "__main__":
     LIDAR_MAP_PATH = INPUT_PATH / "whole_map.pcd"
     QUERY_IMG_DIR_BASE = INPUT_PATH # Query images are in INPUT_PATH / CAMERA_NAME_ARG
     QUERY_IMG_LIST_TPL = INPUT_PATH / "query_image_list_{camera_name}.txt"
-    OUTPUT_DIR_BASE = Path("output_hybrid") # New output directory for hybrid results
+    OUTPUT_DIR_BASE = Path("output") # New output directory for hybrid results
     
     # Initial poses for rendering (T_map_cam)
     INIT_POSE_CSV_PATH = INPUT_PATH / "null_0_0_0_local2global_cam_pose.csv" # CSV for T_map_cam
@@ -5685,7 +5685,7 @@ if __name__ == "__main__":
     d_initial_flat_sensor = pipeline_D_sensor.flatten() if pipeline_D_sensor is not None else np.array([])
     num_d_params = len(d_initial_flat_sensor)
     d_offset_de_specific = { # num_d_params as part of key
-        f"KANNALA_BRANDT_{4}": np.array([0.0001, 0.0001, 0.0001, 0.0001]),
+        f"KANNALA_BRANDT_{4}": np.array([1e-5, 1e-5, 1e-5, 1e-5]),
         f"PINHOLE_{4}": np.array([0.25, 0.15, 0.008, 0.008]), 
         f"PINHOLE_{5}": np.array([0.25, 0.15, 0.008, 0.008, 0.15]) 
     }.get(f"{pipeline_model_type}_{num_d_params}", np.full(num_d_params, default_d_offset_val))
@@ -5700,7 +5700,7 @@ if __name__ == "__main__":
     
     # Dynamic point sizes and thresholds based on image resolution (example)
     reso_ratio = float(pipeline_img_w) / 1920.0 # Assuming 1920px width is baseline
-    dynamic_render_point_size = max(1.0, 5.0 * reso_ratio)
+    dynamic_render_point_size = max(1.0, 4.0 * reso_ratio)
     dynamic_dist_thresh_px = max(5.0, 60.0 * reso_ratio)
     dynamic_pnp_reproj_err = max(2.0, 4.0 * reso_ratio)
     dynamic_vis_map_pt_size = max(1.0, 1.0 * reso_ratio)
