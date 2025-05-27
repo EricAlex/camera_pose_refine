@@ -4139,8 +4139,8 @@ def refine_all_parameters_hybrid(
                     )
     logging.info("Finished pre-calculating GLOBAL fixed targets.")
 
-    # --- 2. Grid-Based Spatial Distribution and Subsampling ---
-    logging.info(f"Applying grid-based spatial distribution (Grid: {spatial_distribution_grid_size}x{spatial_distribution_grid_size}, Max/Cell: {max_points_per_grid_cell})...")
+    # --- 2. Grid-Based Spatial Distribution and Subsampling (MODIFIED SECTION V2 - Nearest to Cell Center) ---
+    logging.info(f"Applying grid-based spatial distribution (Grid: {spatial_distribution_grid_size}x{spatial_distribution_grid_size}, Max/Cell: {max_points_per_grid_cell}) by nearest to cell center...")
     grid_cells_data = [[[] for _ in range(spatial_distribution_grid_size)] for _ in range(spatial_distribution_grid_size)]
     cell_pixel_w = img_width / float(spatial_distribution_grid_size)
     cell_pixel_h = img_height / float(spatial_distribution_grid_size)
@@ -4152,39 +4152,58 @@ def refine_all_parameters_hybrid(
             continue
 
         p2d_ideals_img, P3Ds_world_img = inlier_matches_map_undistorted_ideal_ALL_PNP_SUCCESS[img_idx]
-        targets_distorted_img = precalculated_target_distorted_points_map_GLOBAL_ALL_PNP[img_idx]
+        targets_distorted_img = precalculated_target_distorted_points_map_GLOBAL_ALL_PNP.get(img_idx)
 
-        if p2d_ideals_img.shape[0] != P3Ds_world_img.shape[0] or \
+        if targets_distorted_img is None or \
+           p2d_ideals_img.shape[0] != P3Ds_world_img.shape[0] or \
            p2d_ideals_img.shape[0] != targets_distorted_img.shape[0] or \
            p2d_ideals_img.shape[0] == 0:
-            if p2d_ideals_img.shape[0] > 0 : # Log only if there were points but mismatch
-                logging.warning(f"Data mismatch or empty arrays for img_idx {img_idx} during spatial distribution. Skipping its points.")
+            if p2d_ideals_img.shape[0] > 0:
+                logging.warning(f"Data mismatch or missing targets for img_idx {img_idx} during spatial distribution. Skipping its points.")
             continue
         
         total_pts_before_sampling += p2d_ideals_img.shape[0]
+
         for i in range(p2d_ideals_img.shape[0]):
-            p2d_ideal = p2d_ideals_img[i]
-            col = int(p2d_ideal[0] / cell_pixel_w); row = int(p2d_ideal[1] / cell_pixel_h)
-            col = max(0, min(col, spatial_distribution_grid_size - 1))
-            row = max(0, min(row, spatial_distribution_grid_size - 1))
-            grid_cells_data[row][col].append({
-                "p2d_ideal": p2d_ideal, "P3d_world": P3Ds_world_img[i],
-                "img_idx": img_idx, "target_distorted": targets_distorted_img[i]
+            p2d_ideal = p2d_ideals_img[i] # This is the 2D point in the K_ideal_plane_definition frame
+
+            # Determine grid cell
+            col_idx = int(p2d_ideal[0] / cell_pixel_w)
+            row_idx = int(p2d_ideal[1] / cell_pixel_h)
+            col_idx = max(0, min(col_idx, spatial_distribution_grid_size - 1))
+            row_idx = max(0, min(row_idx, spatial_distribution_grid_size - 1))
+
+            # Calculate center of this grid cell
+            cell_center_x = (col_idx + 0.5) * cell_pixel_w
+            cell_center_y = (row_idx + 0.5) * cell_pixel_h
+            
+            # Calculate distance from p2d_ideal to its cell center
+            distance_to_cell_center = np.linalg.norm(p2d_ideal - np.array([cell_center_x, cell_center_y]))
+            
+            grid_cells_data[row_idx][col_idx].append({
+                "p2d_ideal": p2d_ideal, 
+                "P3d_world": P3Ds_world_img[i],
+                "img_idx": img_idx, 
+                "target_distorted": targets_distorted_img[i],
+                "distance_to_cell_center": distance_to_cell_center # Store the distance
             })
 
     selected_points_for_de_and_ls = []
     for r_idx in range(spatial_distribution_grid_size):
         for c_idx in range(spatial_distribution_grid_size):
-            cell_pts = grid_cells_data[r_idx][c_idx]
-            if not cell_pts: continue
-            if len(cell_pts) > max_points_per_grid_cell:
-                indices_in_cell = np.random.choice(len(cell_pts), max_points_per_grid_cell, replace=False)
-                selected_points_for_de_and_ls.extend([cell_pts[s_idx] for s_idx in indices_in_cell])
-            else:
-                selected_points_for_de_and_ls.extend(cell_pts)
+            cell_pts_with_dist = grid_cells_data[r_idx][c_idx]
+            if not cell_pts_with_dist: 
+                continue
+            
+            # Sort points in the cell by their distance to the cell center (ascending)
+            cell_pts_with_dist.sort(key=lambda x: x["distance_to_cell_center"])
+            
+            # Select up to max_points_per_grid_cell
+            selected_points_for_de_and_ls.extend(cell_pts_with_dist[:max_points_per_grid_cell])
 
     logging.info(f"Collected {total_pts_before_sampling} points before spatial sampling.")
-    logging.info(f"Selected {len(selected_points_for_de_and_ls)} points after grid-based spatial distribution for DE/LS.")
+    logging.info(f"Selected {len(selected_points_for_de_and_ls)} points after grid-based spatial distribution (nearest to cell center) for DE/LS.")
+    # --- END OF MODIFIED SECTION V2 ---
 
     if len(selected_points_for_de_and_ls) < min_total_distributed_points:
         logging.warning(f"Number of spatially distributed points ({len(selected_points_for_de_and_ls)}) "
@@ -5666,7 +5685,7 @@ if __name__ == "__main__":
     d_initial_flat_sensor = pipeline_D_sensor.flatten() if pipeline_D_sensor is not None else np.array([])
     num_d_params = len(d_initial_flat_sensor)
     d_offset_de_specific = { # num_d_params as part of key
-        f"KANNALA_BRANDT_{4}": np.array([0.001, 0.001, 0.001, 0.001]),
+        f"KANNALA_BRANDT_{4}": np.array([0.0001, 0.0001, 0.0001, 0.0001]),
         f"PINHOLE_{4}": np.array([0.25, 0.15, 0.008, 0.008]), 
         f"PINHOLE_{5}": np.array([0.25, 0.15, 0.008, 0.008, 0.15]) 
     }.get(f"{pipeline_model_type}_{num_d_params}", np.full(num_d_params, default_d_offset_val))
@@ -5677,13 +5696,13 @@ if __name__ == "__main__":
     cfg_intrinsic_bounds['ls_k_rel_offset_high'] = 1.1
     cfg_intrinsic_bounds['ls_k_cxcy_abs_offset_px'] = 0.1 * max(pipeline_img_w, pipeline_img_h)
     cfg_intrinsic_bounds['ls_d_abs_offset_scale'] = 0.01
-    cfg_intrinsic_bounds['ls_d_abs_offset_const'] = 0.001
+    cfg_intrinsic_bounds['ls_d_abs_offset_const'] = 0.01
     
     # Dynamic point sizes and thresholds based on image resolution (example)
     reso_ratio = float(pipeline_img_w) / 1920.0 # Assuming 1920px width is baseline
-    dynamic_render_point_size = max(1.0, 4.0 * reso_ratio)
+    dynamic_render_point_size = max(1.0, 5.0 * reso_ratio)
     dynamic_dist_thresh_px = max(5.0, 60.0 * reso_ratio)
-    dynamic_pnp_reproj_err = max(2.0, 2.0 * reso_ratio)
+    dynamic_pnp_reproj_err = max(2.0, 4.0 * reso_ratio)
     dynamic_vis_map_pt_size = max(1.0, 1.0 * reso_ratio)
 
 
@@ -5712,7 +5731,7 @@ if __name__ == "__main__":
         dt_bounds_final_ls=(-0.06, 0.06),     # For final LS dt opt
         final_ls_opt_verbose=1, # Verbosity for final LS
         de_robust_loss_type='cauchy', # Or 'huber', 'linear'
-        de_robust_loss_scale=(0.5*dynamic_pnp_reproj_err), # Example: use PnP reproj error as scale (adjust as needed)
+        de_robust_loss_scale=1.0, # Example: use PnP reproj error as scale (adjust as needed)
         loss_function_final_ls='cauchy',
         visualize_steps=True, num_images_to_visualize=(len(initial_render_poses_map_cam) if initial_render_poses_map_cam else 1),
         visualize_map_point_size=dynamic_vis_map_pt_size,
