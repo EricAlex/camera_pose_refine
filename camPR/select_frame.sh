@@ -4,8 +4,8 @@
 # 参数设置
 cam_name="camera_4"
 # cam_name="panoramic_1"
-src_dir="/home/xin/Downloads/YR-C01-10_20241007_000825/${cam_name}"
-dst_dir="/home/xin/Downloads/Hierarchical-Localization/camPR/input_tmp/${cam_name}"
+src_dir="${cam_name}"
+dst_dir="input_tmp/${cam_name}"
 percent=10  # 修改此处为任意百分比（例如 20 表示 20%）
 
 # ---- New: Define the list file path ----

@@ -4280,7 +4280,7 @@ def refine_all_parameters_hybrid(
     de_start_t = time.time()
     de_res = differential_evolution(de_objective_func_global, bounds=de_bounds, args=(de_obj_data,),
                                   strategy='best1bin', maxiter=de_maxiter, popsize=de_popsize_factor,
-                                  tol=0.001, polish=False, disp=True, workers=de_workers, updating='deferred')
+                                  tol=1e-4, polish=False, disp=True, workers=de_workers, updating='deferred')
     logging.info(f"DE finished in {time.time()-de_start_t:.2f}s. Final avg robust cost: {de_res.fun:.6e}")
 
     if not de_res.success and de_res.fun > 1e5: # High cost threshold indicates severe failure
@@ -5678,9 +5678,9 @@ if __name__ == "__main__":
     # This should be adapted based on expected model_type and D_sensor length
     cfg_intrinsic_bounds = {}
     cfg_intrinsic_bounds['de_xi_abs_offset'] = [0.785, 0.785, 0.785, 0.8, 0.8, 0.8]
-    cfg_intrinsic_bounds['de_k_rel_offset_low'] = 0.9
-    cfg_intrinsic_bounds['de_k_rel_offset_high'] = 1.1
-    cfg_intrinsic_bounds['de_k_cxcy_abs_offset_px'] = 0.1 * max(pipeline_img_w, pipeline_img_h)
+    cfg_intrinsic_bounds['de_k_rel_offset_low'] = 0.999
+    cfg_intrinsic_bounds['de_k_rel_offset_high'] = 1.001
+    cfg_intrinsic_bounds['de_k_cxcy_abs_offset_px'] = 1e-5 * max(pipeline_img_w, pipeline_img_h)
     default_d_offset_val = 0.15 # Default offset if model specific not found
     d_initial_flat_sensor = pipeline_D_sensor.flatten() if pipeline_D_sensor is not None else np.array([])
     num_d_params = len(d_initial_flat_sensor)
@@ -5692,11 +5692,11 @@ if __name__ == "__main__":
     cfg_intrinsic_bounds['de_d_abs_offset'] = d_offset_de_specific
 
     cfg_intrinsic_bounds['ls_xi_abs_offset'] = cfg_intrinsic_bounds['de_xi_abs_offset']
-    cfg_intrinsic_bounds['ls_k_rel_offset_low'] = 0.9
-    cfg_intrinsic_bounds['ls_k_rel_offset_high'] = 1.1
-    cfg_intrinsic_bounds['ls_k_cxcy_abs_offset_px'] = 0.1 * max(pipeline_img_w, pipeline_img_h)
-    cfg_intrinsic_bounds['ls_d_abs_offset_scale'] = 0.01
-    cfg_intrinsic_bounds['ls_d_abs_offset_const'] = 0.01
+    cfg_intrinsic_bounds['ls_k_rel_offset_low'] = cfg_intrinsic_bounds['de_k_rel_offset_low']
+    cfg_intrinsic_bounds['ls_k_rel_offset_high'] = cfg_intrinsic_bounds['de_k_rel_offset_high']
+    cfg_intrinsic_bounds['ls_k_cxcy_abs_offset_px'] = cfg_intrinsic_bounds['de_k_cxcy_abs_offset_px']
+    cfg_intrinsic_bounds['ls_d_abs_offset_scale'] = 1e-5
+    cfg_intrinsic_bounds['ls_d_abs_offset_const'] = 1e-5
     
     # Dynamic point sizes and thresholds based on image resolution (example)
     reso_ratio = float(pipeline_img_w) / 1920.0 # Assuming 1920px width is baseline
@@ -5722,7 +5722,7 @@ if __name__ == "__main__":
         camera_model_type=pipeline_model_type, # Pass model_type
         camera_name_in_list=CAMERA_NAME_ARG,
         # Optional params:
-        voxel_size=0.03, min_height=-2.0, device="auto",
+        voxel_size=0.03, min_height=-100.0, device="auto",
         render_shading_mode='normal', render_point_size=dynamic_render_point_size, intensity_highlight_threshold=0.1,
         feature_conf='superpoint_aachen', matcher_conf='superpoint+lightglue', # matcher_conf not directly used by dist match
         distance_threshold_px=dynamic_dist_thresh_px,
