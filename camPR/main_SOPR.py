@@ -3460,7 +3460,7 @@ if __name__ == "__main__":
     LIDAR_MAP_PATH = INPUT_PATH / "whole_map.pcd"
     QUERY_IMG_DIR = INPUT_PATH / CAMERA_NAME 
     QUERY_IMG_LIST = INPUT_PATH / ("query_image_list_" + CAMERA_NAME + ".txt") # Text file, one image name per line (e.g., frame_00101.png)
-    OUTPUT_DIR = Path("output")
+    OUTPUT_DIR = Path("output") / CAMERA_NAME
     INIT_POSE_PATH = INPUT_PATH / "null_0_0_0_local2global_cam_pose.csv"
     EGO_POSE_CSV_PATH = INPUT_PATH / "null_0_0_0_local2global_pose.csv"
 
